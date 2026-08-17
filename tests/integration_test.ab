@@ -1,0 +1,37 @@
+import "../src/s3.ab"
+import "abla/io"
+
+fun s3IntegrationFailure(code: int, result: S3Result): int {
+    eprintln("S3 integration failure $code: status=${result.status} code=${result.errorCode} message=${result.errorMessage} request=${result.requestId}")
+    code
+}
+
+fun main: int {
+    val config = s3ConfigFromEnvironment()
+    if (!config.valid()) return 1
+    val probe = httpIpv4Client(
+        "${config.host}:${config.port}", config.host, config.port, 65536, 5000
+    ).send(httpGet("/minio/health/ready"))
+    if (!probe.succeeded || !probe.complete || probe.response.status != 200) {
+        eprintln("S3 integration probe failed: host=${config.host} port=${config.port} status=${probe.response.status} succeeded=${probe.succeeded} complete=${probe.complete}")
+        return 7
+    }
+    val client = s3Client(config)
+    val key = "integration/binary-object.dat"
+    val payload = "micro-s3${byteEncode(0)}payload"
+    val uploaded = client.putObject(key, payload)
+    if (!uploaded.succeeded || uploaded.etag == "")
+        return s3IntegrationFailure(2, uploaded)
+    val metadata = client.headObject(key)
+    if (!metadata.succeeded || metadata.etag == "")
+        return s3IntegrationFailure(3, metadata)
+    val downloaded = client.getObject(key)
+    if (!downloaded.succeeded || downloaded.body != payload)
+        return s3IntegrationFailure(4, downloaded)
+    val deleted = client.deleteObject(key)
+    if (!deleted.succeeded) return s3IntegrationFailure(5, deleted)
+    val missing = client.getObject(key)
+    if (missing.succeeded || missing.status != 404 ||
+        missing.errorCode != "NoSuchKey") return s3IntegrationFailure(6, missing)
+    0
+}

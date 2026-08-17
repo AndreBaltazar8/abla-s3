@@ -1,0 +1,168 @@
+import "abla/http"
+import "abla/http/tls"
+import "abla/process/time"
+import "abla/text"
+import "config.ab"
+import "signing.ab"
+
+class S3Result(
+    val succeeded: bool,
+    val status: int,
+    val body: string,
+    val etag: string,
+    val versionId: string,
+    val requestId: string,
+    val errorCode: string,
+    val errorMessage: string,
+    val retries: int
+)
+
+class S3Client(
+    val config: S3Config,
+    val transport: (HttpRequest, int, int) -> HttpClientResult,
+    val clock: () -> string,
+    val wait: (int) -> void
+)
+
+fun s3TransportLimit(maximumBodyBytes: int): int = maximumBodyBytes + 65536
+
+fun s3LoopbackTimeout(timeoutMilliseconds: int): int =
+    if (timeoutMilliseconds > 10000) 10000 else timeoutMilliseconds
+
+fun s3RequestHost(config: S3Config): string =
+    if (config.pathStyle) config.host else "${config.bucket}.${config.host}"
+
+fun s3Client(config: S3Config): S3Client = S3Client(
+    config,
+    { request: HttpRequest, maximum: int, timeout: int ->
+        if (config.useTls) {
+            httpsClient(
+                s3RequestHost(config), config.port,
+                s3TransportLimit(maximum), timeout
+            ).send(request)
+        } else if (config.host == "127.0.0.1") {
+            httpIpv4Client(
+                s3Authority(config), config.host, config.port,
+                s3TransportLimit(maximum), s3LoopbackTimeout(timeout)
+            ).send(request)
+        } else HttpClientResult(HttpResponse(0, [], ""), false, false)
+    },
+    { -> s3NowAmzDate() },
+    { milliseconds: int -> sleep(milliseconds) }
+)
+
+fun s3ClientWithTransport(
+    config: S3Config,
+    transport: (HttpRequest, int, int) -> HttpClientResult,
+    clock: () -> string,
+    wait: (int) -> void
+): S3Client = S3Client(config, transport, clock, wait)
+
+fun s3XmlTag(body: string, name: string): string {
+    val opening = "<$name>"
+    val closing = "</$name>"
+    val begin = textFindSequence(body, opening, 0, body.size)
+    var result = ""
+    if (begin >= 0) {
+        val contentBegin = begin + opening.size
+        val end = textFindSequence(body, closing, contentBegin, body.size)
+        if (end >= contentBegin) result = body.slice(contentBegin, end)
+    }
+    result
+}
+
+fun s3RetryableStatus(status: int): bool =
+    status == 408 || status == 425 || status == 429 || status == 500 ||
+    status == 502 || status == 503 || status == 504
+
+fun s3RetryDelay(retry: int): int {
+    var delay = 100
+    var index = 0
+    while (index < retry) { delay = delay * 2; index = index + 1 }
+    if (delay > 2000) 2000 else delay
+}
+
+fun s3InvalidResult(code: string): S3Result = S3Result(
+    false, 0, "", "", "", "", code, code, 0
+)
+
+fun S3Client.rawRequest(
+    method: string,
+    key: string,
+    body: string = "",
+    contentType: string = ""
+): S3Result {
+    if (!this.config.valid()) return s3InvalidResult("invalid_configuration")
+    if (!s3KeyValid(key)) return s3InvalidResult("invalid_object_key")
+    if (body.size > 67108864) return s3InvalidResult("body_too_large")
+    if (contentType != "" && !s3HeaderValueValid(contentType))
+        return s3InvalidResult("invalid_content_type")
+    val path = s3ObjectPath(this.config, key)
+    var retries = 0
+    var result = s3InvalidResult("transport_failed")
+    var finished = false
+    val clock = this.clock
+    val transport = this.transport
+    val wait = this.wait
+    while (!finished) {
+        val extras: array<S3Header> = []
+        if (contentType != "") extras.append(S3Header("content-type", contentType))
+        val signed = s3SignRequest(
+            this.config, method, path, "", body, clock(), extras
+        )
+        if (!signed.succeeded) return s3InvalidResult(signed.error)
+        val exchanged = transport(
+            httpRequest(method, path, body, signed.headers),
+            this.config.maximumResponseBytes,
+            this.config.timeoutMilliseconds
+        )
+        val headComplete = method == "HEAD" && exchanged.succeeded &&
+            exchanged.response.status >= 100
+        val complete = exchanged.complete || headComplete
+        val bounded = exchanged.response.body.size <=
+            this.config.maximumResponseBytes
+        val status = exchanged.response.status
+        val success = exchanged.succeeded && complete && bounded &&
+            status >= 200 && status < 300
+        val retryable = !exchanged.succeeded || !complete || !bounded ||
+            s3RetryableStatus(status)
+        var errorCode = ""
+        var errorMessage = ""
+        if (!success) {
+            errorCode = s3XmlTag(exchanged.response.body, "Code")
+            errorMessage = s3XmlTag(exchanged.response.body, "Message")
+            if (errorCode == "") errorCode = if (!bounded) "response_too_large"
+                else if (!complete) "incomplete_response"
+                else if (!exchanged.succeeded) "transport_failed"
+                else "s3_error"
+            if (errorMessage == "") errorMessage = errorCode
+        }
+        result = S3Result(
+            success, status, exchanged.response.body,
+            exchanged.response.header("ETag"),
+            exchanged.response.header("x-amz-version-id"),
+            exchanged.response.header("x-amz-request-id"),
+            errorCode, errorMessage, retries
+        )
+        if (!success && retryable && retries < this.config.maximumNetworkRetries) {
+            wait(s3RetryDelay(retries))
+            retries = retries + 1
+        } else finished = true
+    }
+    result
+}
+
+fun S3Client.putObject(
+    key: string,
+    body: string,
+    contentType: string = "application/octet-stream"
+): S3Result = this.rawRequest("PUT", key, body, contentType)
+
+fun S3Client.getObject(key: string): S3Result =
+    this.rawRequest("GET", key)
+
+fun S3Client.headObject(key: string): S3Result =
+    this.rawRequest("HEAD", key)
+
+fun S3Client.deleteObject(key: string): S3Result =
+    this.rawRequest("DELETE", key)

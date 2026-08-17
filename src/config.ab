@@ -1,0 +1,154 @@
+import "abla/bytes"
+import "abla/sys/linux"
+
+class S3Config(
+    val host: string,
+    val port: int,
+    val bucket: string,
+    val regionName: string,
+    val accessKeyId: string,
+    val secretAccessKey: string,
+    val sessionToken: string,
+    val pathStyle: bool,
+    val useTls: bool,
+    val timeoutMilliseconds: int,
+    val maximumResponseBytes: int,
+    val maximumNetworkRetries: int
+)
+
+fun s3AsciiLower(value: string): string {
+    var result = ""
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte >= 65 && byte <= 90)
+            result = "$result${byteEncode(byte + 32)}"
+        else result = "$result${value.slice(index, index + 1)}"
+        index = index + 1
+    }
+    result
+}
+
+fun s3HeaderValueValid(value: string, emptyAllowed: bool = false): bool {
+    var valid = (emptyAllowed || value != "") && value.isValidUtf8()
+    var index = 0
+    while (valid && index < value.size) {
+        if (value[index] < 32 || value[index] == 127) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun s3HostValid(value: string): bool {
+    var valid = value.size > 0 && value.size <= 253 &&
+        value[0] != 46 && value[value.size - 1] != 46 &&
+        value[0] != 45 && value[value.size - 1] != 45
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        if (!((byte >= 97 && byte <= 122) ||
+              (byte >= 48 && byte <= 57) || byte == 45 || byte == 46))
+            valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun s3BucketValid(value: string): bool {
+    var valid = value.size >= 3 && value.size <= 63 &&
+        value[0] != 46 && value[value.size - 1] != 46 &&
+        value[0] != 45 && value[value.size - 1] != 45
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        if (!((byte >= 97 && byte <= 122) ||
+              (byte >= 48 && byte <= 57) || byte == 45 || byte == 46))
+            valid = false
+        if (index > 0 && byte == 46 && value[index - 1] == 46) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun s3RegionValid(value: string): bool {
+    var valid = value.size > 0 && value.size <= 64
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        if (!((byte >= 97 && byte <= 122) ||
+              (byte >= 48 && byte <= 57) || byte == 45)) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun s3CredentialPartValid(value: string, minimum: int, maximum: int): bool =
+    value.size >= minimum && value.size <= maximum &&
+    s3HeaderValueValid(value)
+
+fun S3Config.valid(): bool =
+    s3HostValid(this.host) && this.port > 0 && this.port <= 65535 &&
+    s3BucketValid(this.bucket) && s3RegionValid(this.regionName) &&
+    s3CredentialPartValid(this.accessKeyId, 3, 256) &&
+    s3CredentialPartValid(this.secretAccessKey, 8, 4096) &&
+    s3HeaderValueValid(this.sessionToken, true) &&
+    this.sessionToken.size <= 8192 &&
+    this.timeoutMilliseconds > 0 && this.timeoutMilliseconds <= 600000 &&
+    this.maximumResponseBytes >= 1024 &&
+    this.maximumResponseBytes <= 67108864 &&
+    this.maximumNetworkRetries >= 0 && this.maximumNetworkRetries <= 5 &&
+    (this.useTls || this.host == "127.0.0.1" || this.host == "localhost")
+
+fun s3ParseInt(value: string, fallback: int): int {
+    var result = 0
+    var valid = value.size > 0
+    var index = 0
+    while (valid && index < value.size) {
+        if (value[index] < 48 || value[index] > 57) valid = false
+        else result = result * 10 + value[index] - 48
+        index = index + 1
+    }
+    if (valid) result else fallback
+}
+
+fun s3Environment(name: string, fallback: string): string {
+    val configured = linuxEnvironment(name)
+    if (configured.found && configured.value != "") configured.value else fallback
+}
+
+fun s3Secret(name: string, fileName: string, fallbackName: string): string {
+    val direct = linuxEnvironment(name)
+    val fallback = linuxEnvironment(fallbackName)
+    var result = ""
+    if (direct.found && direct.value != "") result = direct.value
+    else if (fallback.found && fallback.value != "") result = fallback.value
+    else {
+        val file = linuxEnvironment(fileName)
+        if (file.found && file.value != "") {
+            result = linuxReadFile(file.value, 16384)
+            var end = result.size
+            while (end > 0 && (result[end - 1] == 10 || result[end - 1] == 13))
+                end = end - 1
+            result = result.slice(0, end)
+        }
+    }
+    result
+}
+
+fun s3ConfigFromEnvironment(): S3Config = S3Config(
+    s3Environment("S3_ENDPOINT_HOST", "s3.amazonaws.com"),
+    s3ParseInt(s3Environment("S3_ENDPOINT_PORT", "443"), 443),
+    s3Environment("S3_BUCKET", ""),
+    s3Environment("S3_REGION", s3Environment("AWS_REGION", "us-east-1")),
+    s3Secret("S3_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID_FILE", "AWS_ACCESS_KEY_ID"),
+    s3Secret(
+        "S3_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY_FILE",
+        "AWS_SECRET_ACCESS_KEY"
+    ),
+    s3Secret("S3_SESSION_TOKEN", "S3_SESSION_TOKEN_FILE", "AWS_SESSION_TOKEN"),
+    s3Environment("S3_PATH_STYLE", "true") == "true",
+    s3Environment("S3_USE_TLS", "true") == "true",
+    s3ParseInt(s3Environment("S3_TIMEOUT_MS", "30000"), 30000),
+    s3ParseInt(s3Environment("S3_MAX_RESPONSE_BYTES", "33554432"), 33554432),
+    s3ParseInt(s3Environment("S3_MAX_NETWORK_RETRIES", "2"), 2)
+)

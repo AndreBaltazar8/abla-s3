@@ -1,0 +1,83 @@
+import "../src/s3.ab"
+
+var s3ClientTestMode: int = 0
+var s3ClientTestAttempts: int = 0
+var s3ClientTestAuthorization: string = ""
+var s3ClientTestPath: string = ""
+var s3ClientTestBody: string = ""
+
+fun s3ClientTestTransport(
+    request: HttpRequest,
+    maximum: int,
+    timeout: int
+): HttpClientResult {
+    s3ClientTestAttempts = s3ClientTestAttempts + 1
+    s3ClientTestAuthorization = request.header("Authorization")
+    s3ClientTestPath = request.path
+    s3ClientTestBody = request.body
+    if (s3ClientTestMode == 1 && s3ClientTestAttempts == 1)
+        return HttpClientResult(HttpResponse(503, [],
+            "<Error><Code>SlowDown</Code><Message>Wait</Message></Error>"),
+            true, true)
+    if (s3ClientTestMode == 2)
+        return HttpClientResult(HttpResponse(404, [
+            HttpHeader("x-amz-request-id", "request-404")
+        ], "<Error><Code>NoSuchKey</Code><Message>Missing</Message></Error>"),
+        true, true)
+    HttpClientResult(HttpResponse(200, [
+        HttpHeader("ETag", "\"etag-1\""),
+        HttpHeader("x-amz-version-id", "version-1"),
+        HttpHeader("x-amz-request-id", "request-1")
+    ], if (request.method == "GET") "contents" else ""), true, true)
+}
+
+fun s3ClientTestClock(): string = "20260818T000000Z"
+fun s3ClientTestNoWait(milliseconds: int): void {}
+
+fun s3ClientTestConfig(): S3Config = S3Config(
+    "127.0.0.1", 19000, "micro-test", "us-east-1",
+    "test-access-key", "test-secret-key", "", true, false,
+    5000, 1048576, 2
+)
+
+fun main: int {
+    val client = s3ClientWithTransport(
+        s3ClientTestConfig(), s3ClientTestTransport,
+        s3ClientTestClock, s3ClientTestNoWait
+    )
+    s3ClientTestMode = 0
+    s3ClientTestAttempts = 0
+    val uploaded = client.putObject("products/preset.zip", "zip", "application/zip")
+    if (!uploaded.succeeded || s3ClientTestAttempts != 1) return 1
+    if (s3ClientTestPath != "/micro-test/products/preset.zip" ||
+        s3ClientTestBody != "zip") return 2
+    if (s3ClientTestAuthorization.slice(0, 16) != "AWS4-HMAC-SHA256") return 3
+    if (uploaded.etag != "\"etag-1\"" || uploaded.versionId != "version-1" ||
+        uploaded.requestId != "request-1") return 4
+
+    s3ClientTestMode = 1
+    s3ClientTestAttempts = 0
+    val retried = client.getObject("products/preset.zip")
+    if (!retried.succeeded || retried.body != "contents" ||
+        retried.retries != 1 || s3ClientTestAttempts != 2) return 5
+
+    s3ClientTestMode = 2
+    s3ClientTestAttempts = 0
+    val missing = client.getObject("products/missing.zip")
+    if (missing.succeeded || missing.status != 404 ||
+        missing.errorCode != "NoSuchKey" || missing.errorMessage != "Missing" ||
+        missing.requestId != "request-404" || s3ClientTestAttempts != 1) return 6
+
+    s3ClientTestAttempts = 0
+    val invalid = client.getObject("../escape")
+    if (invalid.succeeded || invalid.errorCode != "invalid_object_key" ||
+        s3ClientTestAttempts != 0) return 7
+
+    val insecure = S3Config(
+        "storage.example.com", 80, "micro-test", "us-east-1",
+        "test-access-key", "test-secret-key", "", true, false,
+        5000, 1048576, 0
+    )
+    if (insecure.valid()) return 8
+    0
+}

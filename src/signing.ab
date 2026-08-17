@@ -1,0 +1,246 @@
+import "abla/bytes"
+import "abla/crypto"
+import "abla/http"
+import "abla/sys/linux"
+import "config.ab"
+
+class S3Header(val name: string, val value: string)
+
+class S3Signature(
+    val succeeded: bool,
+    val error: string,
+    val authorization: string,
+    val canonicalRequest: string,
+    val stringToSign: string,
+    val signedHeaders: string,
+    val signature: string,
+    val headers: array<HttpHeader>
+)
+
+fun s3Pad(value: int, width: int): string {
+    var text = "$value"
+    while (text.size < width) text = "0$text"
+    text
+}
+
+fun s3UnixToAmzDate(unixSeconds: int): string {
+    var days = unixSeconds / 86400
+    var seconds = unixSeconds - days * 86400
+    if (seconds < 0) {
+        seconds = seconds + 86400
+        days = days - 1
+    }
+    val shifted = days + 719468
+    val era = if (shifted >= 0) shifted / 146097
+        else (shifted - 146096) / 146097
+    val dayOfEra = shifted - era * 146097
+    val yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 -
+        dayOfEra / 146096) / 365
+    var year = yearOfEra + era * 400
+    val dayOfYear = dayOfEra -
+        (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+    val monthPrime = (5 * dayOfYear + 2) / 153
+    val day = dayOfYear - (153 * monthPrime + 2) / 5 + 1
+    val month = monthPrime + (if (monthPrime < 10) 3 else -9)
+    if (month <= 2) year = year + 1
+    val hour = seconds / 3600
+    val minute = (seconds - hour * 3600) / 60
+    val second = seconds - hour * 3600 - minute * 60
+    "${s3Pad(year, 4)}${s3Pad(month, 2)}${s3Pad(day, 2)}T${s3Pad(hour, 2)}${s3Pad(minute, 2)}${s3Pad(second, 2)}Z"
+}
+
+fun s3RealtimeSeconds(): int {
+    val timestamp = nativeByteBuffer(16)
+    timestamp.storeI64(0, 0)
+    timestamp.storeI64(8, 0)
+    val status = linuxSyscall2(
+        228, 0, nativePointerAddress(timestamp.address)
+    )
+    val result = if (status == 0) timestamp.loadI64(0) else 0
+    timestamp.close()
+    result
+}
+
+fun s3NowAmzDate(): string = s3UnixToAmzDate(s3RealtimeSeconds())
+
+fun s3UriEncode(value: string, preserveSlash: bool = false): string {
+    val hex = "0123456789ABCDEF"
+    var result = ""
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        val unreserved = (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) ||
+            byte == 45 || byte == 46 || byte == 95 || byte == 126 ||
+            (preserveSlash && byte == 47)
+        if (unreserved) result = "$result${value.slice(index, index + 1)}"
+        else {
+            val high = byte / 16
+            val low = byte - high * 16
+            result = "$result%${hex.slice(high, high + 1)}${hex.slice(low, low + 1)}"
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun s3KeyValid(value: string): bool {
+    var valid = value.size > 0 && value.size <= 1024 && value.isValidUtf8() &&
+        value[0] != 47 && value[value.size - 1] != 47
+    var segmentBegin = 0
+    var index = 0
+    while (valid && index <= value.size) {
+        if (index == value.size || value[index] == 47) {
+            val segment = value.slice(segmentBegin, index)
+            if (segment == "" || segment == "." || segment == "..") valid = false
+            segmentBegin = index + 1
+        } else if (value[index] < 32 || value[index] == 127) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun s3StringCompare(left: string, right: string): int {
+    var result = 0
+    var index = 0
+    var more = true
+    while (more && index < left.size && index < right.size) {
+        if (left[index] < right[index]) { result = -1; more = false }
+        else if (left[index] > right[index]) { result = 1; more = false }
+        index = index + 1
+    }
+    if (more && left.size < right.size) result = -1
+    if (more && left.size > right.size) result = 1
+    result
+}
+
+fun s3CanonicalHeaderValue(value: string): string {
+    var result = ""
+    var pendingSpace = false
+    var started = false
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte == 32 || byte == 9) {
+            if (started) pendingSpace = true
+        } else {
+            if (pendingSpace) result = "$result "
+            result = "$result${value.slice(index, index + 1)}"
+            pendingSpace = false
+            started = true
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun s3HeaderNameValid(value: string): bool {
+    var valid = value.size > 0 && value.size <= 64
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        if (!((byte >= 97 && byte <= 122) ||
+              (byte >= 48 && byte <= 57) || byte == 45)) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun s3SigningFailure(message: string): S3Signature = S3Signature(
+    false, message, "", "", "", "", "", []
+)
+
+fun s3Authority(config: S3Config): string {
+    val host = if (config.pathStyle) config.host
+        else "${config.bucket}.${config.host}"
+    if ((config.useTls && config.port == 443) ||
+        (!config.useTls && config.port == 80)) host else "$host:${config.port}"
+}
+
+fun s3ObjectPath(config: S3Config, key: string): string {
+    val encoded = s3UriEncode(key, true)
+    if (config.pathStyle) "/${s3UriEncode(config.bucket)}/$encoded"
+    else "/$encoded"
+}
+
+fun s3SignRequest(
+    config: S3Config,
+    method: string,
+    canonicalUri: string,
+    canonicalQuery: string,
+    body: string,
+    amzDate: string,
+    extraHeaders: array<S3Header> = []
+): S3Signature {
+    if (!config.valid()) return s3SigningFailure("invalid_configuration")
+    if (!(method == "GET" || method == "PUT" || method == "HEAD" ||
+          method == "DELETE")) return s3SigningFailure("invalid_method")
+    if (canonicalUri.size == 0 || canonicalUri[0] != 47 ||
+        amzDate.size != 16 || amzDate[8] != 84 || amzDate[15] != 90)
+        return s3SigningFailure("invalid_request")
+    val payloadHash = hexEncode(sha256(body))
+    val names: array<string> = [
+        "host", "x-amz-content-sha256", "x-amz-date"
+    ]
+    val values: array<string> = [s3Authority(config), payloadHash, amzDate]
+    if (config.sessionToken != "") {
+        names.append("x-amz-security-token")
+        values.append(config.sessionToken)
+    }
+    var extraIndex = 0
+    while (extraIndex < extraHeaders.size) {
+        val name = s3AsciiLower(extraHeaders[extraIndex].name)
+        val value = s3CanonicalHeaderValue(extraHeaders[extraIndex].value)
+        var unique = s3HeaderNameValid(name) && s3HeaderValueValid(value)
+        var foundIndex = 0
+        while (unique && foundIndex < names.size) {
+            if (names[foundIndex] == name) unique = false
+            foundIndex = foundIndex + 1
+        }
+        if (!unique) return s3SigningFailure("invalid_header")
+        names.append(name)
+        values.append(value)
+        extraIndex = extraIndex + 1
+    }
+    var outer = 1
+    while (outer < names.size) {
+        val name = names[outer]
+        val value = values[outer]
+        var inner = outer
+        while (inner > 0 && s3StringCompare(name, names[inner - 1]) < 0) {
+            names[inner] = names[inner - 1]
+            values[inner] = values[inner - 1]
+            inner = inner - 1
+        }
+        names[inner] = name
+        values[inner] = value
+        outer = outer + 1
+    }
+    var canonicalHeaders = ""
+    var signedHeaders = ""
+    val requestHeaders: array<HttpHeader> = []
+    var index = 0
+    while (index < names.size) {
+        canonicalHeaders = "$canonicalHeaders${names[index]}:${values[index]}\n"
+        if (signedHeaders != "") signedHeaders = "$signedHeaders;"
+        signedHeaders = "$signedHeaders${names[index]}"
+        requestHeaders.append(HttpHeader(names[index], values[index]))
+        index = index + 1
+    }
+    val canonicalRequest = "$method\n$canonicalUri\n$canonicalQuery\n$canonicalHeaders\n$signedHeaders\n$payloadHash"
+    val shortDate = amzDate.slice(0, 8)
+    val scope = "$shortDate/${config.regionName}/s3/aws4_request"
+    val canonicalHash = hexEncode(sha256(canonicalRequest))
+    val stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$scope\n$canonicalHash"
+    val dateKey = hmacSha256("AWS4${config.secretAccessKey}", shortDate)
+    val regionKey = hmacSha256(dateKey, config.regionName)
+    val serviceKey = hmacSha256(regionKey, "s3")
+    val signingKey = hmacSha256(serviceKey, "aws4_request")
+    val signature = hexEncode(hmacSha256(signingKey, stringToSign))
+    val authorization = "AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/$scope,SignedHeaders=$signedHeaders,Signature=$signature"
+    requestHeaders.append(HttpHeader("Authorization", authorization))
+    S3Signature(
+        true, "", authorization, canonicalRequest, stringToSign,
+        signedHeaders, signature, requestHeaders
+    )
+}

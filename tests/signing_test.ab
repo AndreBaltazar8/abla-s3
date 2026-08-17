@@ -1,0 +1,41 @@
+import "../src/s3.ab"
+import "abla/io"
+
+fun s3SigningTestConfig(): S3Config = S3Config(
+    "s3.amazonaws.com", 443, "examplebucket", "us-east-1",
+    "AKIAIOSFODNN7EXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "", false, true, 30000, 1048576, 0
+)
+
+fun main: int {
+    if (s3UnixToAmzDate(0) != "19700101T000000Z") return 1
+    if (s3UnixToAmzDate(1369353600) != "20130524T000000Z") return 2
+    if (s3UriEncode("test${byteEncode(36)}file.text") != "test%24file.text") return 3
+    if (s3UriEncode("a/b c", true) != "a/b%20c") return 4
+    if (!s3KeyValid("users/ada/file.txt") || s3KeyValid("../secret") ||
+        s3KeyValid("a//b") || s3KeyValid("/absolute")) return 5
+    val signed = s3SignRequest(
+        s3SigningTestConfig(), "GET", "/test.txt", "", "",
+        "20130524T000000Z", [S3Header("Range", "bytes=0-9")]
+    )
+    if (!signed.succeeded) return 6
+    val emptyHash =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    val expectedCanonical = "GET\n/test.txt\n\nhost:examplebucket.s3.amazonaws.com\nrange:bytes=0-9\nx-amz-content-sha256:$emptyHash\nx-amz-date:20130524T000000Z\n\nhost;range;x-amz-content-sha256;x-amz-date\n$emptyHash"
+    if (signed.canonicalRequest != expectedCanonical) return 7
+    if (signed.signature !=
+        "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41") {
+        println("unexpected AWS reference signature: ${signed.signature}")
+        return 8
+    }
+    if (signed.signedHeaders !=
+        "host;range;x-amz-content-sha256;x-amz-date") return 9
+    if (signed.authorization.slice(0, 16) != "AWS4-HMAC-SHA256") return 10
+    val duplicate = s3SignRequest(
+        s3SigningTestConfig(), "GET", "/test.txt", "", "",
+        "20130524T000000Z", [S3Header("Host", "evil.example")]
+    )
+    if (duplicate.succeeded || duplicate.error != "invalid_header") return 11
+    0
+}

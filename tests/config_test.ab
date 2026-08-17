@@ -1,0 +1,14 @@
+import "../src/s3.ab"
+
+fun main: int {
+    val config = s3ConfigFromEnvironment()
+    if (!config.valid()) return 1
+    if (config.host != "127.0.0.1" || config.port != 19001 ||
+        config.bucket != "micro-config" || config.regionName != "eu-west-1") return 2
+    if (config.accessKeyId != "file-access-key" ||
+        config.secretAccessKey != "file-secret-key" ||
+        config.sessionToken != "session-token") return 3
+    if (!config.pathStyle || config.useTls || config.maximumNetworkRetries != 3)
+        return 4
+    0
+}
