@@ -26,7 +26,9 @@ class S3Client(
 
 fun s3TransportLimit(maximumBodyBytes: int): int = maximumBodyBytes + 65536
 
-fun s3LoopbackTimeout(timeoutMilliseconds: int): int =
+// The hosted Abla TCP transport accepts at most ten seconds for connection
+// establishment. Never pass it a value that would skip the connection.
+fun s3TransportTimeout(timeoutMilliseconds: int): int =
     if (timeoutMilliseconds > 10000) 10000 else timeoutMilliseconds
 
 fun s3RequestHost(config: S3Config): string =
@@ -38,12 +40,12 @@ fun s3Client(config: S3Config): S3Client = S3Client(
         if (config.useTls) {
             httpsClient(
                 s3RequestHost(config), config.port,
-                s3TransportLimit(maximum), timeout
+                s3TransportLimit(maximum), s3TransportTimeout(timeout)
             ).send(request)
         } else if (config.host == "127.0.0.1") {
             httpIpv4Client(
                 s3Authority(config), config.host, config.port,
-                s3TransportLimit(maximum), s3LoopbackTimeout(timeout)
+                s3TransportLimit(maximum), s3TransportTimeout(timeout)
             ).send(request)
         } else HttpClientResult(HttpResponse(0, [], ""), false, false)
     },

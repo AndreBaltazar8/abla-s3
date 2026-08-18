@@ -41,6 +41,8 @@ fun s3ClientTestConfig(): S3Config = S3Config(
 )
 
 fun main: int {
+    if (s3TransportTimeout(30000) != 10000 ||
+        s3TransportTimeout(5000) != 5000) return 9
     val client = s3ClientWithTransport(
         s3ClientTestConfig(), s3ClientTestTransport,
         s3ClientTestClock, s3ClientTestNoWait

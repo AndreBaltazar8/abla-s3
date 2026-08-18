@@ -60,6 +60,10 @@ For virtual-hosted operation, set `S3_PATH_STYLE=false`; the client connects to
 and signs `bucket.endpoint`. Custom providers commonly require path style and a
 provider-specific region value.
 
+The hosted Abla transport bounds TCP connection establishment to ten seconds.
+Larger `S3_TIMEOUT_MS` values remain valid for the client's retry policy and
+are clamped only at the socket-connect boundary.
+
 ## Results and diagnostics
 
 Each operation returns `S3Result` with the HTTP status, response body, ETag,
