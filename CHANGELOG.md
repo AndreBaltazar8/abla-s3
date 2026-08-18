@@ -7,4 +7,4 @@
 - Add bounded PUT, GET, HEAD, and DELETE object operations.
 - Add transient retries, provider diagnostics, file-backed secrets, and
   dependency-injected transport/clock hooks.
-- Verify the AWS reference signature and a real MinIO object lifecycle.
+- Verify the AWS reference signature and a real SeaweedFS S3 object lifecycle.

@@ -3,7 +3,7 @@
 A small, typed S3-compatible client written in Abla. It signs requests with
 AWS Signature Version 4 and provides bounded object upload, download, metadata,
 and deletion for AWS S3-style HTTPS endpoints. The real compatibility suite
-currently exercises MinIO; provider-specific endpoints can use the same typed
+currently exercises SeaweedFS; provider-specific endpoints can use the same typed
 configuration without changing the signing implementation.
 
 ```abla
@@ -82,7 +82,7 @@ make integration
 The pure suite checks AWS's published May 2013 GET-object Signature Version 4
 vector, time/URI canonicalization, hostile object keys, retries, S3 errors,
 bounded configuration, and file-backed credentials. The integration suite
-starts an isolated MinIO server, creates a bucket, and verifies binary-safe
+starts an isolated SeaweedFS S3 server, creates a bucket, and verifies binary-safe
 PUT, HEAD, GET, DELETE, and post-delete denial through the real HTTP protocol.
 
 ## Scope

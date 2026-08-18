@@ -9,13 +9,6 @@ fun s3IntegrationFailure(code: int, result: S3Result): int {
 fun main: int {
     val config = s3ConfigFromEnvironment()
     if (!config.valid()) return 1
-    val probe = httpIpv4Client(
-        "${config.host}:${config.port}", config.host, config.port, 65536, 5000
-    ).send(httpGet("/minio/health/ready"))
-    if (!probe.succeeded || !probe.complete || probe.response.status != 200) {
-        eprintln("S3 integration probe failed: host=${config.host} port=${config.port} status=${probe.response.status} succeeded=${probe.succeeded} complete=${probe.complete}")
-        return 7
-    }
     val client = s3Client(config)
     val key = "integration/binary-object.dat"
     val payload = "micro-s3${byteEncode(0)}payload"
