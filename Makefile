@@ -2,6 +2,8 @@ PROJECT_DIR := $(abspath .)
 ABLAC_DIR ?= $(abspath ../ablac)
 COMPILER ?= $(ABLAC_DIR)/build/ablac
 BUILD_DIR ?= $(PROJECT_DIR)/build
+NIXPKGS_SOURCE ?= $(shell nix eval --raw nixpkgs#path)
+NIXPKGS_IMPORT := -I nixpkgs=$(NIXPKGS_SOURCE)
 
 .PHONY: check test test-in-shell integration integration-in-shell clean
 
@@ -16,7 +18,7 @@ test:
 	@if [ -n "$$IN_NIX_SHELL" ]; then \
 		$(MAKE) test-in-shell; \
 	else \
-		nix-shell $(ABLAC_DIR)/shell.nix --run '$(MAKE) test-in-shell'; \
+		nix-shell $(NIXPKGS_IMPORT) $(ABLAC_DIR)/shell.nix --run '$(MAKE) test-in-shell'; \
 	fi
 
 test-in-shell: check
@@ -30,9 +32,9 @@ test-in-shell: check
 		S3_MAX_NETWORK_RETRIES=3 $(BUILD_DIR)/config-test
 
 integration: check
-	@minio_path=$$(nix-build '<nixpkgs>' -A minio --no-out-link); \
-		mc_path=$$(nix-build '<nixpkgs>' -A minio-client --no-out-link); \
-		nix-shell $(ABLAC_DIR)/shell.nix --run \
+	@minio_path=$$(nix-build $(NIXPKGS_IMPORT) '<nixpkgs>' -A minio --no-out-link); \
+		mc_path=$$(nix-build $(NIXPKGS_IMPORT) '<nixpkgs>' -A minio-client --no-out-link); \
+		nix-shell $(NIXPKGS_IMPORT) $(ABLAC_DIR)/shell.nix --run \
 		"PATH=$$minio_path/bin:$$mc_path/bin:\$$PATH $(MAKE) integration-in-shell"
 
 integration-in-shell:
