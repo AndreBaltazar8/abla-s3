@@ -2,7 +2,10 @@ PROJECT_DIR := $(abspath .)
 ABLAC_DIR ?= $(abspath ../ablac)
 COMPILER ?= $(ABLAC_DIR)/build/ablac
 BUILD_DIR ?= $(PROJECT_DIR)/build
-NIXPKGS_SOURCE ?= $(shell nix eval --raw nixpkgs#path)
+# A literal `#` inside $(shell ...) starts a comment in GNU make 3.81, and the
+# old `\#` escape is kept verbatim since make 4.3; a variable works in both.
+HASH := \#
+NIXPKGS_SOURCE ?= $(shell nix eval --raw nixpkgs$(HASH)path)
 NIXPKGS_IMPORT := -I nixpkgs=$(NIXPKGS_SOURCE)
 
 .PHONY: check test test-in-shell integration integration-in-shell clean
