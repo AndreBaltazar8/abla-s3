@@ -67,9 +67,8 @@ if [[ $ready != true ]]; then
     exit 1
 fi
 
-mc alias set abla-s3-test "http://127.0.0.1:$s3_port" \
-    "$access_key" "$secret_key" >/dev/null
-mc mb abla-s3-test/micro-integration >/dev/null
+printf 's3.bucket.create -name micro-integration\n' |
+    weed shell -master="127.0.0.1:$master_port" >/dev/null
 
 set +e
 env \

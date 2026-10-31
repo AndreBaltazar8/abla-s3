@@ -37,9 +37,8 @@ test-in-shell: check
 
 integration: check
 	@seaweedfs_path=$$(nix-build $(NIXPKGS_IMPORT) '<nixpkgs>' -A seaweedfs --no-out-link); \
-		mc_path=$$(nix-build $(NIXPKGS_IMPORT) '<nixpkgs>' -A minio-client --no-out-link); \
 		nix-shell $(NIXPKGS_IMPORT) $(ABLAC_DIR)/shell.nix --run \
-		"PATH=$$seaweedfs_path/bin:$$mc_path/bin:\$$PATH $(MAKE) integration-in-shell"
+		"PATH=$$seaweedfs_path/bin:\$$PATH $(MAKE) integration-in-shell"
 
 integration-in-shell:
 	bash tools/test-s3.sh $(BUILD_DIR)/integration-test
