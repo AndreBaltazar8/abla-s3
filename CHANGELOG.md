@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add streaming transfers of any size in bounded memory: `uploadFile`,
+  `uploadStream`, `downloadFile`, and `downloadStream`, with multipart upload,
+  retried parts, abort on failure, and downloads that resume from the last byte.
+- Add the multipart operations themselves, and `listMultipartUploads` and
+  `abortIncompleteUploads` for what a killed process leaves behind.
+- Add presigned GET, PUT, and upload-part URLs.
+- Report `contentLength` in `S3Result`.
 - Read provider error codes and messages with abla-xml, so escaped text is
   decoded. A body that isn't well-formed XML gives no provider fields, and the
   generic error code is reported instead.

@@ -7,6 +7,9 @@ BUILD_DIR ?= $(PROJECT_DIR)/build
 HASH := \#
 NIXPKGS_SOURCE ?= $(shell nix eval --raw nixpkgs$(HASH)path)
 NIXPKGS_IMPORT := -I nixpkgs=$(NIXPKGS_SOURCE)
+# The file `make integration` pushes through SeaweedFS and back, in MiB. Over
+# 3 GiB by default; CI runs a smaller one.
+S3_TEST_FILE_MIB ?= 3200
 # CI's released compiler builds programs that run outside the Nix shell, not in it.
 INTEGRATION_SHELL ?= nix-shell $(NIXPKGS_IMPORT) $(ABLAC_DIR)/shell.nix --run
 
@@ -19,6 +22,8 @@ check:
 	$(COMPILER) build tests/client_test.ab -o $(BUILD_DIR)/client-test --no-cache
 	$(COMPILER) build tests/config_test.ab -o $(BUILD_DIR)/config-test --no-cache
 	$(COMPILER) build tests/integration_test.ab -o $(BUILD_DIR)/integration-test --no-cache
+	$(COMPILER) build tests/transfer_test.ab -o $(BUILD_DIR)/transfer-test --no-cache
+	$(COMPILER) build tests/transfer_tool.ab -o $(BUILD_DIR)/transfer-tool --no-cache
 
 test:
 	@if [ -n "$$IN_NIX_SHELL" ]; then \
@@ -30,6 +35,7 @@ test:
 test-in-shell: check
 	$(BUILD_DIR)/signing-test
 	$(BUILD_DIR)/client-test
+	$(BUILD_DIR)/transfer-test
 	S3_ENDPOINT_HOST=127.0.0.1 S3_ENDPOINT_PORT=19001 \
 		S3_BUCKET=micro-config S3_REGION=eu-west-1 \
 		S3_ACCESS_KEY_ID_FILE=$(PROJECT_DIR)/tests/access_key_fixture.txt \
@@ -43,6 +49,7 @@ integration: check
 
 integration-in-shell:
 	bash tools/test-s3.sh $(BUILD_DIR)/integration-test
+	bash tools/test-transfers.sh $(BUILD_DIR)/transfer-tool $(S3_TEST_FILE_MIB)
 
 clean:
 	@if [ -d "$(BUILD_DIR)" ]; then gio trash "$(BUILD_DIR)"; fi

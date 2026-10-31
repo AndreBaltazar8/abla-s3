@@ -4,6 +4,7 @@ import "abla/process/time"
 import github("AndreBaltazar8/abla-xml")
 import "config.ab"
 import "signing.ab"
+import "wire.ab"
 
 class S3Result(
     val succeeded: bool,
@@ -14,25 +15,19 @@ class S3Result(
     val requestId: string,
     val errorCode: string,
     val errorMessage: string,
-    val retries: int
+    val retries: int,
+    val contentLength: int = -1
 )
 
 class S3Client(
     val config: S3Config,
     val transport: (HttpRequest, int, int) -> HttpClientResult,
     val clock: () -> string,
-    val wait: (int) -> void
+    val wait: (int) -> void,
+    val connect: () -> S3Wire = s3NoWire
 )
 
 fun s3TransportLimit(maximumBodyBytes: int): int = maximumBodyBytes + 65536
-
-// The hosted Abla TCP transport accepts at most ten seconds for connection
-// establishment. Never pass it a value that would skip the connection.
-fun s3TransportTimeout(timeoutMilliseconds: int): int =
-    if (timeoutMilliseconds > 10000) 10000 else timeoutMilliseconds
-
-fun s3RequestHost(config: S3Config): string =
-    if (config.pathStyle) config.host else "${config.bucket}.${config.host}"
 
 fun s3Client(config: S3Config): S3Client = S3Client(
     config,
@@ -50,7 +45,8 @@ fun s3Client(config: S3Config): S3Client = S3Client(
         } else HttpClientResult(HttpResponse(0, [], ""), false, false)
     },
     { -> s3NowAmzDate() },
-    { milliseconds: int -> sleep(milliseconds) }
+    { milliseconds: int -> sleep(milliseconds) },
+    { -> s3OpenWire(config) }
 )
 
 fun s3ClientWithTransport(
@@ -59,6 +55,20 @@ fun s3ClientWithTransport(
     clock: () -> string,
     wait: (int) -> void
 ): S3Client = S3Client(config, transport, clock, wait)
+
+// For the transfer operations, which talk to a wire instead of the transport.
+fun s3ClientWithWire(
+    config: S3Config,
+    connect: () -> S3Wire,
+    clock: () -> string,
+    wait: (int) -> void
+): S3Client = S3Client(
+    config,
+    { request: HttpRequest, maximum: int, timeout: int ->
+        HttpClientResult(HttpResponse(0, [], ""), false, false)
+    },
+    clock, wait, connect
+)
 
 fun s3RetryableStatus(status: int): bool =
     status == 408 || status == 425 || status == 429 || status == 500 ||
@@ -134,7 +144,8 @@ fun S3Client.rawRequest(
             exchanged.response.header("ETag"),
             exchanged.response.header("x-amz-version-id"),
             exchanged.response.header("x-amz-request-id"),
-            errorCode, errorMessage, retries
+            errorCode, errorMessage, retries,
+            s3ContentLength(exchanged.response.header("Content-Length"))
         )
         if (!success && retryable && retries < this.config.maximumNetworkRetries) {
             wait(s3RetryDelay(retries))

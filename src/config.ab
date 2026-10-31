@@ -16,6 +16,14 @@ class S3Config(
     val maximumNetworkRetries: int
 )
 
+fun s3RequestHost(config: S3Config): string =
+    if (config.pathStyle) config.host else "${config.bucket}.${config.host}"
+
+// The hosted Abla TCP transport accepts at most ten seconds for connection
+// establishment. Never pass it a value that would skip the connection.
+fun s3TransportTimeout(timeoutMilliseconds: int): int =
+    if (timeoutMilliseconds > 10000) 10000 else timeoutMilliseconds
+
 fun s3AsciiLower(value: string): string {
     var result = ""
     var index = 0

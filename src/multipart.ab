@@ -1,0 +1,560 @@
+import "abla/bytes"
+import "abla/crypto"
+import "abla/http"
+import "abla/sys/linux"
+import github("AndreBaltazar8/abla-xml")
+import "config.ab"
+import "signing.ab"
+import "wire.ab"
+import "client.ab"
+
+fun s3MinimumPartBytes(): int = 5242880
+fun s3MaximumPartBytes(): int = 5368709120
+fun s3MaximumParts(): int = 10000
+
+class S3CompletedPart(val partNumber: int, val etag: string)
+
+class S3MultipartStart(
+    val succeeded: bool,
+    val uploadId: string,
+    val result: S3Result
+)
+
+class S3IncompleteUpload(
+    val key: string,
+    val uploadId: string,
+    val initiated: string
+)
+
+class S3UploadList(
+    val succeeded: bool,
+    val uploads: array<S3IncompleteUpload>,
+    val truncated: bool,
+    val nextKeyMarker: string,
+    val nextUploadIdMarker: string,
+    val result: S3Result
+)
+
+class S3AbortSweep(
+    val succeeded: bool,
+    val aborted: int,
+    val failed: int,
+    val errorCode: string
+)
+
+// What a request sends: either the strings that are already in memory, or a
+// range of an open file that is read a little at a time for each attempt.
+class S3RequestBody(
+    val size: int,
+    val pieces: array<string>,
+    val descriptor: int,
+    val offset: int,
+    var sourceFailed: bool = false
+)
+
+fun s3MemoryBody(pieces: array<string>): S3RequestBody {
+    var size = 0
+    var index = 0
+    while (index < pieces.size) {
+        size = size + pieces[index].size
+        index = index + 1
+    }
+    S3RequestBody(size, pieces, -1, 0)
+}
+
+private fun s3XmlEscape(value: string): string {
+    var output = ""
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        output = if (byte == 38) "$output&amp;"
+            else if (byte == 60) "$output&lt;"
+            else if (byte == 62) "$output&gt;"
+            else if (byte == 34) "$output&quot;"
+            else "$output${value.slice(index, index + 1)}"
+        index = index + 1
+    }
+    output
+}
+
+// S3 may send whitespace ahead of a slow result, and XML forbids it there.
+private fun s3XmlDocument(body: string): XmlDocument? {
+    var begin = 0
+    while (begin < body.size && (body[begin] == 32 || body[begin] == 10 ||
+        body[begin] == 13 || body[begin] == 9)) begin = begin + 1
+    xmlParse(body.slice(begin, body.size)).document
+}
+
+// The error code of an S3 error document, or "".
+fun xmlErrorDocument(body: string): string {
+    val document = s3XmlDocument(body)
+    if (document != null) document.root.childText("Code") else ""
+}
+
+fun s3PayloadHash(body: string): string = hexEncode(sha256(body))
+
+// An empty key addresses the bucket itself, for path-style and virtual hosts.
+fun S3Client.objectPath(key: string): string =
+    if (key != "") s3ObjectPath(this.config, key)
+    else if (this.config.pathStyle) "/${s3UriEncode(this.config.bucket)}"
+    else "/"
+
+// One attempt. The request is signed for this attempt's time, the connection
+// serves only this request, and a failed write still reads the response: a
+// server that refuses an upload often says why before closing the socket.
+fun S3Client.sendOnce(
+    method: string,
+    key: string,
+    query: string,
+    var body: S3RequestBody,
+    extras: array<S3Header>,
+    payloadHash: string
+): S3Result {
+    val clock = this.clock
+    val path = this.objectPath(key)
+    val signed = s3SignRequest(
+        this.config, method, path, query, "", clock(), extras, payloadHash
+    )
+    if (!signed.succeeded) return s3InvalidResult(signed.error)
+    val connect = this.connect
+    val wire = connect()
+    if (!wire.connected) return S3Result(
+        false, 0, "", "", "", "", "transport_failed", "transport_failed", 0
+    )
+    val headers: array<HttpHeader> = []
+    var index = 0
+    while (index < signed.headers.size) {
+        headers.append(signed.headers[index])
+        index = index + 1
+    }
+    headers.append(HttpHeader("Content-Length", "${body.size}"))
+    val write = wire.write
+    val head = HttpRequest(method, path, query, headers, "", [], [])
+        .renderForClient(s3Authority(this.config))
+    val sent = write(head) && s3WriteBody(wire, body)
+    if (body.sourceFailed) {
+        val close = wire.close
+        close()
+        return s3InvalidResult("source_read_failed")
+    }
+    val received = s3ReadHead(wire)
+    val response = received.response
+    val status = response.status
+    var bodyText = ""
+    var complete = received.received
+    var bounded = true
+    if (received.received && method != "HEAD") {
+        val rest = s3ReadSmallBody(
+            wire, received, this.config.maximumResponseBytes
+        )
+        bodyText = rest.body
+        complete = rest.complete || status == 204
+        bounded = rest.bounded
+    }
+    val close = wire.close
+    close()
+    val success = sent && complete && bounded && status >= 200 && status < 300
+    var errorCode = ""
+    var errorMessage = ""
+    if (!success) {
+        val document = s3XmlDocument(bodyText)
+        if (document != null) {
+            errorCode = document.root.childText("Code")
+            errorMessage = document.root.childText("Message")
+        }
+        if (errorCode == "") errorCode = if (!received.received) "transport_failed"
+            else if (!bounded) "response_too_large"
+            else if (!complete) "incomplete_response"
+            else if (!sent) "transport_failed"
+            else "s3_error"
+        if (errorMessage == "") errorMessage = errorCode
+    }
+    S3Result(
+        success, status, bodyText, response.header("ETag"),
+        response.header("x-amz-version-id"),
+        response.header("x-amz-request-id"),
+        errorCode, errorMessage, 0,
+        s3ContentLength(response.header("Content-Length"))
+    )
+}
+
+fun s3ReadFileAt(descriptor: int, offset: int, maximum: int): string {
+    val buffer = nativeByteBuffer(maximum + 1)
+    var measured = linuxSyscall4(
+        17, descriptor, nativePointerAddress(buffer.address), maximum, offset
+    )
+    while (measured == -4) measured = linuxSyscall4(
+        17, descriptor, nativePointerAddress(buffer.address), maximum, offset
+    )
+    if (measured > 0) buffer.adoptString(measured)
+    else {
+        buffer.close()
+        ""
+    }
+}
+
+fun s3WriteBody(wire: S3Wire, var body: S3RequestBody): bool {
+    val write = wire.write
+    var sent = true
+    var index = 0
+    while (sent && index < body.pieces.size) {
+        sent = write(body.pieces[index])
+        index = index + 1
+    }
+    if (body.descriptor >= 0) {
+        var done = 0
+        while (sent && done < body.size) {
+            val remaining = body.size - done
+            val bytes = s3ReadFileAt(
+                body.descriptor, body.offset + done,
+                if (remaining < 1048576) remaining else 1048576
+            )
+            if (bytes.size == 0) {
+                body.sourceFailed = true
+                sent = false
+            } else {
+                sent = write(bytes)
+                done = done + bytes.size
+            }
+        }
+    }
+    sent
+}
+
+fun s3RetryableResult(result: S3Result): bool =
+    s3RetryableStatus(result.status) || result.errorCode == "RequestTimeout" ||
+    result.errorCode == "transport_failed" ||
+    result.errorCode == "incomplete_response"
+
+// A small request of the multipart protocol, with its payload signed.
+fun S3Client.controlRequest(
+    method: string,
+    key: string,
+    query: string,
+    body: string = "",
+    extras: array<S3Header> = []
+): S3Result {
+    if (!this.config.valid()) return s3InvalidResult("invalid_configuration")
+    if (key != "" && !s3KeyValid(key)) return s3InvalidResult("invalid_object_key")
+    val wait = this.wait
+    var retries = 0
+    var request = s3MemoryBody(if (body == "") [] else [body])
+    val hash = s3PayloadHash(body)
+    var result = this.sendOnce(method, key, query, request, extras, hash)
+    while (!result.succeeded && s3RetryableResult(result) &&
+        retries < this.config.maximumNetworkRetries) {
+        wait(s3RetryDelay(retries))
+        retries = retries + 1
+        result = this.sendOnce(method, key, query, request, extras, hash)
+    }
+    S3Result(
+        result.succeeded, result.status, result.body, result.etag,
+        result.versionId, result.requestId, result.errorCode,
+        result.errorMessage, retries, result.contentLength
+    )
+}
+
+// HEAD through the wire, with the object's size in `contentLength`.
+fun S3Client.statObject(key: string): S3Result {
+    if (!s3KeyValid(key)) return s3InvalidResult("invalid_object_key")
+    this.controlRequest("HEAD", key, "")
+}
+
+fun S3Client.createMultipartUpload(
+    key: string,
+    contentType: string = "application/octet-stream"
+): S3MultipartStart {
+    if (!s3KeyValid(key)) return S3MultipartStart(
+        false, "", s3InvalidResult("invalid_object_key")
+    )
+    if (!s3HeaderValueValid(contentType)) return S3MultipartStart(
+        false, "", s3InvalidResult("invalid_content_type")
+    )
+    val result = this.controlRequest(
+        "POST", key, "uploads=", "", [S3Header("content-type", contentType)]
+    )
+    var uploadId = ""
+    if (result.succeeded) {
+        val document = s3XmlDocument(result.body)
+        if (document != null) uploadId = document.root.childText("UploadId")
+    }
+    if (result.succeeded && uploadId == "") return S3MultipartStart(
+        false, "", s3InvalidResult("invalid_response")
+    )
+    S3MultipartStart(result.succeeded, uploadId, result)
+}
+
+fun s3PartQuery(uploadId: string, partNumber: int): string =
+    s3CanonicalQuery(["partNumber", "uploadId"], ["$partNumber", uploadId])
+
+fun s3UploadQuery(uploadId: string): string =
+    s3CanonicalQuery(["uploadId"], [uploadId])
+
+// One part, one attempt-limited send. Parts travel with an unsigned payload:
+// hashing here would mean holding and walking every byte in Abla once more,
+// and TLS already protects them on the way.
+fun S3Client.sendPart(
+    key: string,
+    uploadId: string,
+    partNumber: int,
+    var body: S3RequestBody,
+    maximumRetries: int
+): S3Result {
+    val wait = this.wait
+    val query = s3PartQuery(uploadId, partNumber)
+    var retries = 0
+    var result = this.sendOnce("PUT", key, query, body, [], "UNSIGNED-PAYLOAD")
+    while (!result.succeeded && !body.sourceFailed &&
+        s3RetryableResult(result) && retries < maximumRetries) {
+        wait(s3RetryDelay(retries))
+        retries = retries + 1
+        result = this.sendOnce("PUT", key, query, body, [], "UNSIGNED-PAYLOAD")
+    }
+    if (result.succeeded && result.etag == "") return S3Result(
+        false, result.status, "", "", "", result.requestId,
+        "missing_etag", "missing_etag", retries
+    )
+    S3Result(
+        result.succeeded, result.status, result.body, result.etag,
+        result.versionId, result.requestId, result.errorCode,
+        result.errorMessage, retries, result.contentLength
+    )
+}
+
+// For callers that assemble parts themselves. Transfers use uploadFile and
+// uploadStream, which also bound the memory and clean up after a failure.
+fun S3Client.uploadPart(
+    key: string,
+    uploadId: string,
+    partNumber: int,
+    bytes: string,
+    maximumRetries: int = 4
+): S3Result {
+    if (!s3KeyValid(key)) return s3InvalidResult("invalid_object_key")
+    if (partNumber < 1 || partNumber > s3MaximumParts())
+        return s3InvalidResult("invalid_part_number")
+    var body = s3MemoryBody([bytes])
+    this.sendPart(key, uploadId, partNumber, body, maximumRetries)
+}
+
+fun s3CompleteBody(parts: array<S3CompletedPart>): string {
+    val output = byteBuffer()
+    output.appendText("<CompleteMultipartUpload>")
+    var index = 0
+    while (index < parts.size) {
+        output.appendText(
+            "<Part><PartNumber>${parts[index].partNumber}</PartNumber><ETag>${s3XmlEscape(parts[index].etag)}</ETag></Part>"
+        )
+        index = index + 1
+    }
+    output.appendText("</CompleteMultipartUpload>")
+    output.toText()
+}
+
+// A complete can answer 200 with an <Error> document, because S3 commits to the
+// status before the slow work is finished. Only a real result counts.
+fun S3Client.completeMultipartUpload(
+    key: string,
+    uploadId: string,
+    parts: array<S3CompletedPart>
+): S3Result {
+    if (!s3KeyValid(key)) return s3InvalidResult("invalid_object_key")
+    if (parts.size == 0 || parts.size > s3MaximumParts())
+        return s3InvalidResult("invalid_part_count")
+    val query = s3UploadQuery(uploadId)
+    val body = s3CompleteBody(parts)
+    val wait = this.wait
+    var retries = 0
+    var finished = false
+    var result = s3InvalidResult("transport_failed")
+    while (!finished) {
+        result = this.controlRequest("POST", key, query, body)
+        var retryable = !result.succeeded && s3RetryableResult(result)
+        if (result.succeeded) {
+            val document = s3XmlDocument(result.body)
+            if (document == null || document.root.localName == "Error") {
+                val code = if (document != null) document.root.childText("Code")
+                    else "invalid_response"
+                val message = if (document != null) document.root.childText("Message")
+                    else "invalid_response"
+                result = S3Result(
+                    false, result.status, result.body, "", "", result.requestId,
+                    if (code == "") "s3_error" else code,
+                    if (message == "") "s3_error" else message, retries
+                )
+                retryable = code == "InternalError" || code == "SlowDown" ||
+                    code == "ServiceUnavailable" || code == "RequestTimeout"
+            } else {
+                val etag = document.root.childText("ETag")
+                result = S3Result(
+                    true, result.status, result.body,
+                    if (etag != "") etag else result.etag, result.versionId,
+                    result.requestId, "", "", retries + result.retries
+                )
+            }
+        } else retries = retries + result.retries
+        if (retryable && retries < this.config.maximumNetworkRetries) {
+            wait(s3RetryDelay(retries))
+            retries = retries + 1
+        } else finished = true
+    }
+    result
+}
+
+// An upload that is already gone counts as aborted.
+fun S3Client.abortMultipartUpload(key: string, uploadId: string): S3Result {
+    if (!s3KeyValid(key)) return s3InvalidResult("invalid_object_key")
+    val result = this.controlRequest("DELETE", key, s3UploadQuery(uploadId))
+    if (!result.succeeded && result.errorCode == "NoSuchUpload") S3Result(
+        true, result.status, "", "", "", result.requestId, "", "", result.retries
+    ) else result
+}
+
+// One page of the bucket's unfinished uploads under `prefix`.
+fun S3Client.listMultipartUploads(
+    prefix: string = "",
+    keyMarker: string = "",
+    uploadIdMarker: string = ""
+): S3UploadList {
+    val names: array<string> = ["uploads"]
+    val values: array<string> = [""]
+    if (prefix != "") { names.append("prefix"); values.append(prefix) }
+    if (keyMarker != "") {
+        names.append("key-marker")
+        values.append(keyMarker)
+        if (uploadIdMarker != "") {
+            names.append("upload-id-marker")
+            values.append(uploadIdMarker)
+        }
+    }
+    val result = this.bucketRequest(s3CanonicalQuery(names, values))
+    val uploads: array<S3IncompleteUpload> = []
+    if (!result.succeeded)
+        return S3UploadList(false, uploads, false, "", "", result)
+    val document = s3XmlDocument(result.body)
+    if (document == null) return S3UploadList(
+        false, uploads, false, "", "", s3InvalidResult("invalid_response")
+    )
+    val found = document.root.elements("Upload")
+    var index = 0
+    while (index < found.size) {
+        uploads.append(S3IncompleteUpload(
+            found[index].childText("Key"), found[index].childText("UploadId"),
+            found[index].childText("Initiated")
+        ))
+        index = index + 1
+    }
+    S3UploadList(
+        true, uploads, document.root.childText("IsTruncated") == "true",
+        document.root.childText("NextKeyMarker"),
+        document.root.childText("NextUploadIdMarker"), result
+    )
+}
+
+// GET on the bucket itself rather than on an object.
+fun S3Client.bucketRequest(query: string): S3Result {
+    if (!this.config.valid()) return s3InvalidResult("invalid_configuration")
+    val wait = this.wait
+    var retries = 0
+    var empty = s3MemoryBody([])
+    val hash = s3PayloadHash("")
+    var result = this.sendOnce("GET", "", query, empty, [], hash)
+    while (!result.succeeded && s3RetryableResult(result) &&
+        retries < this.config.maximumNetworkRetries) {
+        wait(s3RetryDelay(retries))
+        retries = retries + 1
+        result = this.sendOnce("GET", "", query, empty, [], hash)
+    }
+    result
+}
+
+// Cleans up after a process that died mid-upload, which no client code can do
+// for itself. `initiatedBefore` (an ISO 8601 UTC time, compared as text) spares
+// uploads that may still be running; without it every match is aborted.
+fun S3Client.abortIncompleteUploads(
+    prefix: string = "",
+    initiatedBefore: string = ""
+): S3AbortSweep {
+    var aborted = 0
+    var failed = 0
+    var keyMarker = ""
+    var uploadIdMarker = ""
+    var more = true
+    var errorCode = ""
+    while (more) {
+        val page = this.listMultipartUploads(prefix, keyMarker, uploadIdMarker)
+        if (!page.succeeded) {
+            errorCode = page.result.errorCode
+            more = false
+        } else {
+            var index = 0
+            while (index < page.uploads.size) {
+                val upload = page.uploads[index]
+                if (initiatedBefore == "" ||
+                    s3StringCompare(upload.initiated, initiatedBefore) < 0) {
+                    val result = this.abortMultipartUpload(upload.key, upload.uploadId)
+                    if (result.succeeded) aborted = aborted + 1
+                    else {
+                        failed = failed + 1
+                        errorCode = result.errorCode
+                    }
+                }
+                index = index + 1
+            }
+            keyMarker = page.nextKeyMarker
+            uploadIdMarker = page.nextUploadIdMarker
+            more = page.truncated && keyMarker != ""
+        }
+    }
+    S3AbortSweep(errorCode == "", aborted, failed, errorCode)
+}
+
+fun S3Client.presignGet(
+    key: string,
+    expiresSeconds: int = 3600,
+    downloadFilename: string = ""
+): S3PresignedUrl {
+    if (!s3KeyValid(key)) return S3PresignedUrl(false, "invalid_object_key", "", 0)
+    val names: array<string> = []
+    val values: array<string> = []
+    if (downloadFilename != "") {
+        if (!s3HeaderValueValid(downloadFilename) ||
+            downloadFilename.contains("\"") || downloadFilename.contains("\\"))
+            return S3PresignedUrl(false, "invalid_filename", "", 0)
+        names.append("response-content-disposition")
+        values.append("attachment; filename=\"$downloadFilename\"")
+    }
+    val clock = this.clock
+    s3PresignRequest(
+        this.config, "GET", this.objectPath(key), clock(), expiresSeconds,
+        names, values
+    )
+}
+
+// A single PUT; S3 limits these to 5 GiB. Larger objects use presignUploadPart.
+fun S3Client.presignPut(key: string, expiresSeconds: int = 3600): S3PresignedUrl {
+    if (!s3KeyValid(key)) return S3PresignedUrl(false, "invalid_object_key", "", 0)
+    val clock = this.clock
+    s3PresignRequest(
+        this.config, "PUT", this.objectPath(key), clock(), expiresSeconds
+    )
+}
+
+// Lets a browser or another host send one part directly to S3. The caller
+// starts the upload, collects each part's ETag from the responses, and calls
+// completeMultipartUpload (or abortMultipartUpload) itself.
+fun S3Client.presignUploadPart(
+    key: string,
+    uploadId: string,
+    partNumber: int,
+    expiresSeconds: int = 3600
+): S3PresignedUrl {
+    if (!s3KeyValid(key)) return S3PresignedUrl(false, "invalid_object_key", "", 0)
+    if (partNumber < 1 || partNumber > s3MaximumParts())
+        return S3PresignedUrl(false, "invalid_part_number", "", 0)
+    val clock = this.clock
+    s3PresignRequest(
+        this.config, "PUT", this.objectPath(key), clock(), expiresSeconds,
+        ["partNumber", "uploadId"], ["$partNumber", uploadId]
+    )
+}

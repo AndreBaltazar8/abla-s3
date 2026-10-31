@@ -1,0 +1,847 @@
+// The transfer operations against an in-memory S3 behind a fake wire: every
+// request is checked as it would be seen on a socket, and any of them can be made
+// to fail. tools/test-transfers.sh does the same against a real server.
+import "../src/s3.ab"
+import "abla/fs"
+import "abla/http"
+import "abla/io"
+import "abla/memory"
+import "abla/sys/linux"
+
+// What the fake stores.
+var fakeObject: string = ""
+var fakeObjectStored: bool = false
+var fakeEtag: string = "\"object-1\""
+var fakeParts: array<array<string>> = []
+var fakeUploadOpen: bool = false
+var fakeKeepBodies: bool = true
+
+// What it saw.
+var fakeLog: array<string> = []
+var fakeCompleteBody: string = ""
+var fakeLastRequest: HttpRequest = httpRequest("GET", "/")
+var fakeWires: int = 0
+var fakeWiresClosed: int = 0
+
+// Faults, consumed in order: "<operation> <kind>". An operation is CREATE, PART<n>,
+// COMPLETE, ABORT, HEAD, GET or PUT. Kinds: a status, "drop" (the connection ends
+// with no response), "writefail" (the body can't be written), "cut" (the response
+// ends halfway), "errordoc", "nosuchupload", "badrange", "wrongetag".
+var fakeFaults: array<string> = []
+var fakeCut: int = 1000
+var fakeHeadLength: int = -1
+
+// The request on the wire now.
+var fakeHead: string = ""
+var fakeBody: array<string> = []
+var fakeBodySize: int = 0
+var fakeOutput: string = ""
+var fakeOutputOffset: int = 0
+var fakeAnswered: bool = false
+var fakeWriteFails: bool = false
+
+fun fakeHeader(name: string, value: string): string = "$name: $value\r\n"
+
+fun fakeRespond(status: int, headers: string, body: string): string =
+    "HTTP/1.1 $status X\r\n${headers}Content-Length: ${body.size}\r\n\r\n$body"
+
+fun fakeError(status: int, code: string): string = fakeRespond(
+    status, fakeHeader("x-amz-request-id", "request-$code"),
+    "<Error><Code>$code</Code><Message>$code happened</Message></Error>"
+)
+
+fun fakeOperation(request: HttpRequest): string {
+    val partNumber = request.queryParameter("partNumber")
+    if (partNumber != "") "PART$partNumber"
+    else if (request.method == "POST" && request.query == "uploads=") "CREATE"
+    else if (request.method == "POST") "COMPLETE"
+    else if (request.method == "DELETE") "ABORT"
+    else request.method
+}
+
+fun fakeTakeFault(operation: string): string {
+    var index = 0
+    var found = ""
+    while (found == "" && index < fakeFaults.size) {
+        val fault = fakeFaults[index]
+        if (fault.size > operation.size && fault.slice(0, operation.size) == operation &&
+            fault[operation.size] == 32) {
+            found = fault.slice(operation.size + 1, fault.size)
+            val rest: array<string> = []
+            var other = 0
+            while (other < fakeFaults.size) {
+                if (other != index) rest.append(fakeFaults[other])
+                other = other + 1
+            }
+            fakeFaults = rest
+        }
+        index = index + 1
+    }
+    found
+}
+
+fun fakeJoin(pieces: array<string>): string {
+    val out = byteBuffer()
+    var index = 0
+    while (index < pieces.size) {
+        out.appendText(pieces[index])
+        index = index + 1
+    }
+    out.toText()
+}
+
+fun fakeAuthorized(request: HttpRequest, unsigned: bool): bool {
+    val hash = request.header("x-amz-content-sha256")
+    request.header("Authorization").startsWith("AWS4-HMAC-SHA256") &&
+        (hash == "UNSIGNED-PAYLOAD") == unsigned
+}
+
+fun fakeGet(request: HttpRequest, fault: string): string {
+    if (!fakeObjectStored) return fakeError(404, "NoSuchKey")
+    val range = request.header("range")
+    val ifMatch = request.header("if-match")
+    if (ifMatch != "" && ifMatch != fakeEtag)
+        return fakeError(412, "PreconditionFailed")
+    val total = fakeObject.size
+    var first = 0
+    var last = total - 1
+    if (range != "") {
+        val dash = range.indexOf("-")
+        first = s3ParseInt(range.slice(6, dash), 0)
+        last = s3ParseInt(range.slice(dash + 1, range.size), total - 1)
+    }
+    if (fault == "badrange") first = first + 1
+    val etag = if (fault == "wrongetag") "\"other\"" else fakeEtag
+    val headers = "${fakeHeader("ETag", etag)}${fakeHeader("Content-Range", "bytes $first-$last/$total")}"
+    fakeRespond(206, headers, fakeObject.slice(first, last + 1))
+}
+
+fun s3TestHex(value: int): string {
+    val digits = "0123456789abcdef"
+    var output = ""
+    var remaining = value
+    while (remaining > 0) {
+        output = "${digits.slice(remaining % 16, remaining % 16 + 1)}$output"
+        remaining = remaining / 16
+    }
+    output
+}
+
+fun fakeHandle(request: HttpRequest): string {
+    val operation = fakeOperation(request)
+    fakeLog.append(operation)
+    fakeLastRequest = request
+    val fault = fakeTakeFault(operation)
+    if (fault == "drop") return ""
+    if (fault == "nosuchupload") return fakeError(404, "NoSuchUpload")
+    if (fault != "" && fault[0] >= 48 && fault[0] <= 57)
+        return fakeError(s3ParseInt(fault, 500), "Injected")
+    if (operation == "CREATE") {
+        fakeUploadOpen = true
+        fakeParts = []
+        return fakeRespond(200, "", "<?xml version=\"1.0\"?>\n<InitiateMultipartUploadResult><UploadId>up/1&amp;2</UploadId></InitiateMultipartUploadResult>")
+    }
+    if (operation.startsWith("PART")) {
+        if (request.queryParameter("uploadId") != "up%2F1%262")
+            return fakeError(400, "BadUploadId")
+        if (!fakeAuthorized(request, true)) return fakeError(403, "Unsigned")
+        val number = s3ParseInt(request.queryParameter("partNumber"), 0)
+        while (fakeParts.size < number) fakeParts.append([])
+        fakeParts[number - 1] = fakeBody
+        return fakeRespond(200, fakeHeader("ETag", "\"part-$number\""), "")
+    }
+    if (operation == "COMPLETE") {
+        if (!fakeAuthorized(request, false)) return fakeError(403, "Signed")
+        fakeCompleteBody = fakeJoin(fakeBody)
+        if (fault == "errordoc") return fakeRespond(200, "",
+            "  \n<Error><Code>InternalError</Code><Message>Later</Message></Error>")
+        if (fault == "fatal") return fakeRespond(200, "",
+            "<Error><Code>InvalidPart</Code><Message>No</Message></Error>")
+        val pieces: array<string> = []
+        var index = 0
+        while (index < fakeParts.size) {
+            pieces.append(fakeJoin(fakeParts[index]))
+            index = index + 1
+        }
+        fakeObject = fakeJoin(pieces)
+        fakeObjectStored = true
+        fakeUploadOpen = false
+        // Chunked, and with leading whitespace, as S3 does for a slow complete.
+        val xml = "\n  <CompleteMultipartUploadResult><ETag>\"whole-1\"</ETag></CompleteMultipartUploadResult>"
+        return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n${s3TestHex(xml.size)}\r\n$xml\r\n0\r\n\r\n"
+    }
+    if (operation == "ABORT") {
+        if (!fakeUploadOpen) return fakeError(404, "NoSuchUpload")
+        fakeUploadOpen = false
+        fakeParts = []
+        return "HTTP/1.1 204 No Content\r\n\r\n"
+    }
+    if (operation == "PUT") {
+        if (!fakeAuthorized(request, true)) return fakeError(403, "Unsigned")
+        fakeObject = fakeJoin(fakeBody)
+        fakeObjectStored = true
+        return fakeRespond(200, fakeHeader("ETag", fakeEtag), "")
+    }
+    if (operation == "HEAD") {
+        if (!fakeObjectStored) return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+        val length = if (fakeHeadLength >= 0) fakeHeadLength else fakeObject.size
+        return "HTTP/1.1 200 OK\r\nETag: $fakeEtag\r\nContent-Length: $length\r\n\r\n"
+    }
+    val response = fakeGet(request, fault)
+    if (fault == "cut") response.slice(0, response.size - response.size / 2)
+    else if (fakeCut < response.size && fault == "cutat")
+        response.slice(0, fakeCut)
+    else response
+}
+
+fun fakeWrite(bytes: string): bool {
+    if (fakeHead == "") {
+        fakeHead = bytes
+        val request = httpParseRequest(bytes)
+        val operation = fakeOperation(request)
+        fakeWriteFails = fakeTakeFault("$operation-body") == "writefail"
+        return true
+    }
+    if (fakeWriteFails) return false
+    if (fakeKeepBodies) fakeBody.append(bytes)
+    fakeBodySize = fakeBodySize + bytes.size
+    true
+}
+
+fun fakeRead(maximum: int): string {
+    if (!fakeAnswered) {
+        fakeAnswered = true
+        fakeOutput = if (fakeWriteFails) "" else {
+            if (!fakeKeepBodies) fakeBody = []
+            fakeHandle(httpParseRequest(fakeHead))
+        }
+    }
+    val end = if (fakeOutputOffset + maximum < fakeOutput.size)
+        fakeOutputOffset + maximum else fakeOutput.size
+    val bytes = fakeOutput.slice(fakeOutputOffset, end)
+    fakeOutputOffset = end
+    bytes
+}
+
+fun fakeConnect(): S3Wire {
+    fakeWires = fakeWires + 1
+    fakeHead = ""
+    fakeBody = []
+    fakeBodySize = 0
+    fakeOutput = ""
+    fakeOutputOffset = 0
+    fakeAnswered = false
+    fakeWriteFails = false
+    S3Wire(true, fakeWrite, fakeRead, { ->
+        fakeWiresClosed = fakeWiresClosed + 1
+        return
+    })
+}
+
+fun fakeReset(): void {
+    fakeObject = ""
+    fakeObjectStored = false
+    fakeEtag = "\"object-1\""
+    fakeParts = []
+    fakeUploadOpen = false
+    fakeLog = []
+    fakeFaults = []
+    fakeCompleteBody = ""
+    fakeHeadLength = -1
+    fakeKeepBodies = true
+    return
+}
+
+fun testConfig(): S3Config = S3Config(
+    "127.0.0.1", 19000, "micro-test", "us-east-1",
+    "test-access-key", "test-secret-key", "", true, false,
+    5000, 1048576, 2
+)
+
+fun testClock(): string = "20260818T000000Z"
+var testWaits: int = 0
+fun testWait(milliseconds: int): void {
+    testWaits = testWaits + 1
+    return
+}
+
+// Bytes in which an offset error can't go unnoticed.
+fun testData(size: int): string {
+    val out = byteBuffer()
+    var written = 0
+    var block = 0
+    while (written < size) {
+        val line = "block ${block}: abcdefghijklmnopqrstuvwxyz\n"
+        val wanted = size - written
+        out.appendText(if (line.size > wanted) line.slice(0, wanted) else line)
+        written = written + (if (line.size > wanted) wanted else line.size)
+        block = block + 1
+    }
+    out.toText()
+}
+
+fun testLog(): string {
+    var text = ""
+    var index = 0
+    while (index < fakeLog.size) {
+        text = if (index == 0) fakeLog[index] else "$text ${fakeLog[index]}"
+        index = index + 1
+    }
+    text
+}
+
+val mib = 1048576
+val fiveMib = 5242880
+
+fun expectLog(code: int, expected: string): int {
+    if (testLog() == expected) 0 else {
+        eprintln("check $code: log is ${testLog()}, expected $expected")
+        code
+    }
+}
+
+fun testOptions(retries: int = 2, resume: bool = false): S3TransferOptions =
+    S3TransferOptions(fiveMib, retries, -1, resume)
+
+// Hands `data` over in chunks of `chunkSize`, then the end.
+class TestSource(val data: string, val chunkSize: int, var offset: int, val failAt: int)
+
+fun testNext(var source: TestSource): S3Chunk {
+    if (source.failAt >= 0 && source.offset >= source.failAt) return s3ChunkFailed()
+    if (source.offset >= source.data.size) return s3ChunkEnd()
+    val end = if (source.offset + source.chunkSize < source.data.size)
+        source.offset + source.chunkSize else source.data.size
+    val bytes = source.data.slice(source.offset, end)
+    source.offset = end
+    s3Chunk(bytes)
+}
+
+fun uploadChunks(
+    client: S3Client,
+    data: string,
+    chunkSize: int,
+    options: S3TransferOptions,
+    failAt: int = -1
+): S3TransferResult {
+    var source = TestSource(data, chunkSize, 0, failAt)
+    val next = { -> testNext(source) }
+    client.uploadStream("big/object.bin", next, "application/zip", options)
+}
+
+fun testUploads(client: S3Client): int {
+    val data = testData(12 * mib)
+
+    // Three parts, the last one short, assembled in order and verified at the end.
+    fakeReset()
+    val three = uploadChunks(client, data, 70000, testOptions())
+    if (!three.succeeded || three.parts != 3 || three.bytes != data.size ||
+        three.retries != 0 || three.etag != "\"whole-1\"") return 100
+    var failed = expectLog(101, "CREATE PART1 PART2 PART3 COMPLETE HEAD")
+    if (failed != 0) return failed
+    if (fakeObject != data) return 102
+    if (fakeUploadOpen) return 103
+    // ETag quotes are escaped in the XML, in order.
+    if (fakeCompleteBody != "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;part-1&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;part-2&quot;</ETag></Part><Part><PartNumber>3</PartNumber><ETag>&quot;part-3&quot;</ETag></Part></CompleteMultipartUpload>") return 104
+    if (fakeWires != fakeWiresClosed) return 105
+
+    // A chunk larger than a part, and one that ends exactly on a part boundary.
+    fakeReset()
+    val large = uploadChunks(client, data, 8 * mib, testOptions())
+    if (!large.succeeded || large.parts != 3 || fakeObject != data) return 106
+    fakeReset()
+    val exact = uploadChunks(client, testData(2 * fiveMib), fiveMib, testOptions())
+    if (!exact.succeeded || exact.parts != 2) return 107
+    failed = expectLog(108, "CREATE PART1 PART2 COMPLETE HEAD")
+    if (failed != 0) return failed
+
+    // What fits in one part is one PUT, including nothing at all.
+    fakeReset()
+    val small = uploadChunks(client, "tiny", 2, testOptions())
+    if (!small.succeeded || small.parts != 1 || fakeObject != "tiny") return 109
+    failed = expectLog(110, "PUT HEAD")
+    if (failed != 0) return failed
+    if (fakeLastRequest.method != "HEAD") return 111
+    fakeReset()
+    val empty = uploadChunks(client, "", 2, testOptions())
+    if (!empty.succeeded || empty.bytes != 0 || !fakeObjectStored) return 112
+    fakeReset()
+    fakeFaults = ["PUT 503", "PUT drop"]
+    val retriedPut = uploadChunks(client, "tiny", 2, testOptions())
+    if (!retriedPut.succeeded || retriedPut.retries != 2 || fakeObject != "tiny") return 113
+
+    // A part retried after a status, a lost response, and a failed write resends
+    // the same bytes, and the object comes out whole.
+    fakeReset()
+    fakeFaults = ["PART2 500", "PART2 drop", "PART3-body writefail"]
+    val retried = uploadChunks(client, data, 70000, testOptions(4))
+    if (!retried.succeeded || retried.retries != 3 || fakeObject != data) return 114
+    failed = expectLog(115, "CREATE PART1 PART2 PART2 PART2 PART3 COMPLETE HEAD")
+    if (failed != 0) return failed
+
+    // Out of retries: aborted, nothing completed, nothing left.
+    fakeReset()
+    fakeFaults = ["PART2 500", "PART2 500", "PART2 500"]
+    val exhausted = uploadChunks(client, data, 70000, testOptions(2))
+    if (exhausted.succeeded || exhausted.errorCode != "Injected" ||
+        exhausted.status != 500 || exhausted.leftoverUploadId != "" ||
+        exhausted.parts != 1 || fakeUploadOpen || fakeObjectStored) return 116
+    failed = expectLog(117, "CREATE PART1 PART2 PART2 PART2 ABORT")
+    if (failed != 0) return failed
+
+    // A refusal isn't retried.
+    fakeReset()
+    fakeFaults = ["PART1 403"]
+    val refused = uploadChunks(client, data, 70000, testOptions(4))
+    if (refused.succeeded || refused.status != 403 || fakeUploadOpen) return 118
+    failed = expectLog(119, "CREATE PART1 ABORT")
+    if (failed != 0) return failed
+
+    // A source failure stops the upload, even when a whole part is ready.
+    fakeReset()
+    val broken = uploadChunks(client, data, 70000, testOptions(), 7 * mib)
+    if (broken.succeeded || broken.errorCode != "source_failed" ||
+        fakeUploadOpen || fakeObjectStored) return 120
+    failed = expectLog(121, "CREATE PART1 ABORT")
+    if (failed != 0) return failed
+    // Before anything was sent there is nothing to abort.
+    fakeReset()
+    val brokenEarly = uploadChunks(client, data, 70000, testOptions(), 0)
+    if (brokenEarly.succeeded || fakeLog.size != 0) return 122
+
+    // When the abort fails too, the caller is told what's still stored.
+    fakeReset()
+    fakeFaults = ["PART1 403", "ABORT 403"]
+    val stuck = uploadChunks(client, data, 70000, testOptions())
+    if (stuck.succeeded || stuck.leftoverUploadId != "up/1&2") return 123
+
+    // A failed create has nothing to abort or report as left over.
+    fakeReset()
+    fakeFaults = ["CREATE 403"]
+    val noStart = uploadChunks(client, data, 70000, testOptions())
+    if (noStart.succeeded || noStart.leftoverUploadId != "" ||
+        noStart.status != 403) return 124
+    failed = expectLog(125, "CREATE")
+    if (failed != 0) return failed
+
+    // A complete can answer 200 with an error in the body.
+    fakeReset()
+    fakeFaults = ["COMPLETE errordoc"]
+    val later = uploadChunks(client, data, 70000, testOptions())
+    if (!later.succeeded || fakeObject != data) return 126
+    fakeReset()
+    fakeFaults = ["COMPLETE fatal"]
+    val invalid = uploadChunks(client, data, 70000, testOptions())
+    if (invalid.succeeded || invalid.errorCode != "InvalidPart" ||
+        fakeUploadOpen || fakeObjectStored) return 127
+    failed = expectLog(128, "CREATE PART1 PART2 PART3 COMPLETE ABORT")
+    if (failed != 0) return failed
+
+    // A complete that worked but lost its response finds the upload gone.
+    fakeReset()
+    fakeFaults = ["COMPLETE drop", "COMPLETE nosuchupload"]
+    fakeObject = data
+    fakeObjectStored = true
+    val lost = uploadChunks(client, data, 70000, testOptions())
+    if (!lost.succeeded || lost.leftoverUploadId != "") return 129
+    // But not when the object isn't what was sent.
+    fakeReset()
+    fakeFaults = ["COMPLETE drop", "COMPLETE nosuchupload"]
+    fakeObject = "something else"
+    fakeObjectStored = true
+    val notLost = uploadChunks(client, data, 70000, testOptions())
+    if (notLost.succeeded) return 130
+
+    // The stored size has to match what was sent.
+    fakeReset()
+    fakeHeadLength = 1
+    val wrongSize = uploadChunks(client, data, 70000, testOptions())
+    if (wrongSize.succeeded || wrongSize.errorCode != "size_mismatch") return 131
+
+    // More than 10,000 parts stop short and clean up. The bodies aren't kept.
+    fakeReset()
+    fakeKeepBodies = false
+    val block = testData(fiveMib)
+    var count = 0
+    val endless = { ->
+        count = count + 1
+        s3Chunk(block)
+    }
+    val tooMany = client.uploadStream("big/object.bin", endless, "application/zip", testOptions())
+    if (tooMany.succeeded || tooMany.errorCode != "too_many_parts" ||
+        tooMany.parts != 10000 || fakeUploadOpen) return 132
+    fakeKeepBodies = true
+
+    // Options are checked before anything happens.
+    fakeReset()
+    val tooSmall = S3TransferOptions(fiveMib - 1)
+    val tooBig = S3TransferOptions(5368709121)
+    if (uploadChunks(client, "x", 1, tooSmall).errorCode != "invalid_part_size" ||
+        uploadChunks(client, "x", 1, tooBig).errorCode != "invalid_part_size" ||
+        fakeLog.size != 0) return 133
+    // A part the memory limit could never hold is an error, not a panic.
+    memorySetLimit(8589934592)
+    if (uploadChunks(client, "x", 1, S3TransferOptions(5368709120)).errorCode !=
+        "part_exceeds_memory_limit") return 134
+    var source = TestSource("x", 1, 0, -1)
+    val next = { -> testNext(source) }
+    if (client.uploadStream("../escape", next).errorCode != "invalid_object_key") return 135
+
+    // Part sizes grow so that a known size fits in 10,000 parts.
+    if (s3PartSizeFor(fiveMib, 100) != fiveMib) return 136
+    if (s3PartSizeFor(fiveMib, 10000 * fiveMib) != fiveMib) return 137
+    if (s3PartSizeFor(fiveMib, 10000 * fiveMib + 1) != fiveMib + 1) return 138
+    0
+}
+
+fun testFiles(client: S3Client, directory: Path): int {
+    val data = testData(12 * mib)
+    val source = directory.child("source.bin")
+    if (!source.writeText(data)) return 200
+
+    fakeReset()
+    val whole = client.uploadFile("big/file.bin", source, "application/zip", testOptions())
+    if (!whole.succeeded || whole.parts != 3 || fakeObject != data) return 201
+    var failed = expectLog(202, "CREATE PART1 PART2 PART3 COMPLETE HEAD")
+    if (failed != 0) return failed
+
+    // A retried file part reads the same range again.
+    fakeReset()
+    fakeFaults = ["PART2-body writefail", "PART3 500"]
+    val retried = client.uploadFile("big/file.bin", source, "application/zip", testOptions())
+    if (!retried.succeeded || retried.retries != 2 || fakeObject != data) return 203
+
+    val small = directory.child("small.bin")
+    small.writeText("tiny")
+    fakeReset()
+    val one = client.uploadFile("big/small.bin", small, "text/plain", testOptions())
+    if (!one.succeeded || fakeObject != "tiny") return 204
+    failed = expectLog(205, "PUT HEAD")
+    if (failed != 0) return failed
+    val nothing = directory.child("nothing.bin")
+    nothing.writeText("")
+    fakeReset()
+    if (!client.uploadFile("big/nothing.bin", nothing).succeeded || !fakeObjectStored) return 206
+
+    fakeReset()
+    if (client.uploadFile("big/x", directory.child("absent")).errorCode !=
+        "source_not_a_file" || fakeLog.size != 0) return 207
+    if (client.uploadFile("big/x", directory).errorCode != "source_not_a_file") return 208
+
+    // Downloads appear only once complete.
+    val target = directory.child("deep/target.bin")
+    val partial = Path("${target.text}.s3part")
+    fakeReset()
+    fakeObject = data
+    fakeObjectStored = true
+    val fetched = client.downloadFile("big/file.bin", target, testOptions())
+    if (!fetched.succeeded || fetched.bytes != data.size) return 209
+    if (target.readText() != data || partial.exists()) return 210
+    if (target.info().size != data.size) return 211
+
+    // A failed download removes its bytes and leaves an existing target alone.
+    target.writeText("previous")
+    fakeFaults = ["GET 403"]
+    val refused = client.downloadFile("big/file.bin", target, testOptions())
+    if (refused.succeeded || refused.status != 403 || partial.exists()) return 212
+    if (target.readText() != "previous") return 213
+
+    // With resume, the bytes stay, and the next call fetches only the rest.
+    target.remove()
+    fakeLog = []
+    fakeCut = 3 * mib
+    fakeFaults = ["GET cutat", "GET 403"]
+    val cut = client.downloadFile("big/file.bin", target, testOptions(0, true))
+    if (cut.succeeded || target.exists() || !partial.exists()) return 214
+    val kept = partial.info().size
+    if (kept == 0 || kept >= data.size) return 215
+    val resumed = client.downloadFile("big/file.bin", target, testOptions(0, true))
+    if (!resumed.succeeded || target.readText() != data) return 216
+    if (fakeLastRequest.header("range") != "bytes=$kept-${data.size - 1}") return 217
+    if (partial.exists() || Path("${partial.text}.meta").exists()) return 218
+
+    // If the object changed in between, it starts again rather than splice.
+    target.remove()
+    fakeCut = 3 * mib
+    fakeFaults = ["GET cutat", "GET 403"]
+    client.downloadFile("big/file.bin", target, testOptions(0, true))
+    if (!partial.exists()) return 219
+    val replaced = testData(7 * mib).slice(1, 7 * mib)
+    fakeObject = replaced
+    fakeEtag = "\"object-2\""
+    val restarted = client.downloadFile("big/file.bin", target, testOptions(0, true))
+    if (!restarted.succeeded || target.readText() != replaced) return 220
+    if (fakeLastRequest.header("range") != "bytes=0-${replaced.size - 1}") return 221
+
+    // An empty object and a missing one.
+    fakeObject = ""
+    fakeEtag = "\"empty\""
+    if (!client.downloadFile("big/empty.bin", target, testOptions()).succeeded ||
+        target.readText() != "" || target.info().size != 0) return 222
+    fakeReset()
+    target.remove()
+    val missing = client.downloadFile("big/none.bin", target, testOptions())
+    if (missing.succeeded || missing.status != 404 || target.exists()) return 223
+
+    // A file that changes during the upload never becomes an object.
+    fakeReset()
+    val moving = directory.child("moving.bin")
+    moving.writeText(data)
+    testMoving = moving
+    var movingClient = s3ClientWithWire(testConfig(), testMovingConnect, testClock, testWait)
+    testMovingArmed = true
+    val changed = movingClient.uploadFile("big/moving.bin", moving, "text/plain", testOptions())
+    if (changed.succeeded || changed.errorCode != "source_changed" ||
+        fakeUploadOpen || fakeObjectStored) return 224
+
+    // A file that shrinks under the reader is a source failure, without retries.
+    fakeReset()
+    moving.writeText(data)
+    testShrinking = true
+    testMovingArmed = true
+    val shrunk = movingClient.uploadFile("big/moving.bin", moving, "text/plain", testOptions(4))
+    if (shrunk.succeeded || shrunk.errorCode != "source_read_failed" ||
+        fakeUploadOpen || fakeObjectStored) return 225
+    0
+}
+
+var testMoving: Path = Path("")
+var testMovingArmed: bool = false
+var testShrinking: bool = false
+
+// Changes the file as soon as the first part is on its way.
+fun testMovingConnect(): S3Wire {
+    if (testMovingArmed && fakeLog.size >= 1) {
+        testMovingArmed = false
+        if (testShrinking) testMoving.writeText("short")
+        else testMoving.appendText("more")
+    }
+    fakeConnect()
+}
+
+fun testDownloads(client: S3Client): int {
+    val data = testData(3 * mib)
+    fakeReset()
+    fakeObject = data
+    fakeObjectStored = true
+    var out = byteBuffer()
+    var pieces = 0
+    var largest = 0
+    val sink = { bytes: string ->
+        out.appendText(bytes)
+        pieces = pieces + 1
+        if (bytes.size > largest) largest = bytes.size
+        true
+    }
+    val plain = client.downloadStream("big/file.bin", sink, testOptions())
+    if (!plain.succeeded || plain.bytes != data.size || out.toText() != data) return 300
+    if (pieces < 11 || largest > 262144) return 301
+    if (fakeLastRequest.header("if-match") != fakeEtag) return 302
+    if (fakeLastRequest.header("range") != "bytes=0-${data.size - 1}") return 303
+
+    // Cut, then a 503, then a lost connection, then cut again: nothing is
+    // delivered twice or missed.
+    out = byteBuffer()
+    fakeLog = []
+    fakeCut = mib
+    fakeFaults = ["GET cutat", "GET 503", "GET drop", "GET cutat"]
+    val resumed = client.downloadStream("big/file.bin", sink, testOptions(2))
+    if (!resumed.succeeded || resumed.retries != 4 || out.toText() != data) return 304
+    if (resumed.bytes != data.size) return 305
+
+    // Without progress, retries run out; with it, they don't.
+    fakeLog = []
+    out = byteBuffer()
+    fakeFaults = ["GET 500", "GET 500", "GET 500"]
+    val exhausted = client.downloadStream("big/file.bin", sink, testOptions(2))
+    if (exhausted.succeeded || exhausted.errorCode != "Injected" || exhausted.bytes != 0) return 306
+    var failed = expectLog(307, "HEAD GET GET GET")
+    if (failed != 0) return failed
+    fakeLog = []
+    out = byteBuffer()
+    fakeCut = mib
+    fakeFaults = ["GET cutat", "GET cutat", "GET cutat", "GET cutat", "GET cutat"]
+    val progressing = client.downloadStream("big/file.bin", sink, testOptions(0))
+    if (!progressing.succeeded || out.toText() != data) return 308
+
+    // Wrong answers stop at once rather than corrupt the output.
+    fakeFaults = ["GET badrange"]
+    out = byteBuffer()
+    val wrongRange = client.downloadStream("big/file.bin", sink, testOptions())
+    if (wrongRange.succeeded || wrongRange.errorCode != "invalid_response_range" ||
+        out.size() != 0) return 309
+    fakeFaults = ["GET wrongetag"]
+    val wrongEtag = client.downloadStream("big/file.bin", sink, testOptions())
+    if (wrongEtag.succeeded || wrongEtag.errorCode != "object_changed") return 310
+    fakeFaults = ["GET 412"]
+    val changed = client.downloadStream("big/file.bin", sink, testOptions())
+    if (changed.succeeded || changed.errorCode != "object_changed") return 311
+
+    // A refusing sink ends the transfer without further requests.
+    fakeLog = []
+    val refusing = { bytes: string -> false }
+    val stopped = client.downloadStream("big/file.bin", refusing, testOptions())
+    if (stopped.succeeded || stopped.errorCode != "sink_failed") return 312
+    failed = expectLog(313, "HEAD GET")
+    if (failed != 0) return failed
+
+    // Nothing to fetch for an empty object.
+    fakeReset()
+    fakeObject = ""
+    fakeObjectStored = true
+    val empty = client.downloadStream("big/empty.bin", sink, testOptions())
+    if (!empty.succeeded || empty.bytes != 0) return 314
+    failed = expectLog(315, "HEAD")
+    if (failed != 0) return failed
+    fakeReset()
+    val missing = client.downloadStream("big/none.bin", sink, testOptions())
+    if (missing.succeeded || missing.status != 404) return 316
+    0
+}
+
+fun testPresigning(client: S3Client): int {
+    // AWS's published query-string example for GET /test.txt.
+    val aws = S3Config(
+        "s3.amazonaws.com", 443, "examplebucket", "us-east-1",
+        "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "", false, true, 30000, 1048576, 0
+    )
+    val published = s3PresignRequest(aws, "GET", "/test.txt", "20130524T000000Z", 86400)
+    if (published.url != "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404") {
+        eprintln("presigned: ${published.url}")
+        return 400
+    }
+    if (s3PresignRequest(aws, "GET", "/a", "20130524T000000Z", 0).succeeded ||
+        s3PresignRequest(aws, "GET", "/a", "20130524T000000Z", 604801).succeeded ||
+        s3PresignRequest(aws, "POST", "/a", "20130524T000000Z", 60).succeeded) return 401
+    val local = client.presignGet("a b/c.txt", 60)
+    if (!local.url.startsWith("http://127.0.0.1:19000/micro-test/a%20b/c.txt?X-Amz-Algorithm=")) return 402
+    if (client.presignGet("../x").error != "invalid_object_key" ||
+        client.presignPut("../x").error != "invalid_object_key" ||
+        client.presignUploadPart("../x", "u", 1).error != "invalid_object_key") return 403
+    val part = client.presignUploadPart("a.bin", "up/1", 7, 60)
+    if (!part.succeeded || !part.url.contains("partNumber=7&uploadId=up%2F1&X-Amz-")) return 404
+    if (client.presignUploadPart("a.bin", "u", 0).succeeded ||
+        client.presignUploadPart("a.bin", "u", 10001).succeeded) return 405
+    val named = client.presignGet("a.bin", 60, "report 1.pdf")
+    if (!named.url.contains("response-content-disposition=attachment%3B%20filename%3D%22report%201.pdf%22")) return 406
+    if (client.presignGet("a.bin", 60, "bad\"name").succeeded) return 407
+    val temporary = S3Config(
+        "127.0.0.1", 19000, "micro-test", "us-east-1",
+        "test-access-key", "test-secret-key", "token/1", true, false, 5000, 1048576, 0
+    )
+    if (!s3PresignRequest(temporary, "GET", "/a", "20130524T000000Z", 60)
+        .url.contains("X-Amz-Security-Token=token%2F1")) return 408
+
+    // Signing an unsigned payload, and sorted query parameters.
+    val unsigned = s3SignRequest(
+        aws, "PUT", "/test.txt", s3CanonicalQuery(["uploadId", "partNumber"], ["a/b", "2"]),
+        "", "20130524T000000Z", [], "UNSIGNED-PAYLOAD"
+    )
+    if (unsigned.canonicalRequest != "PUT\n/test.txt\npartNumber=2&uploadId=a%2Fb\nhost:examplebucket.s3.amazonaws.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD") return 409
+    if (unsigned.headers[1].value != "UNSIGNED-PAYLOAD") return 410
+    0
+}
+
+// A wire that answers with these reads, then with nothing.
+var scriptedReads: array<string> = []
+var scriptedNext: int = 0
+
+fun scriptedWire(reads: array<string>): S3Wire {
+    scriptedReads = reads
+    scriptedNext = 0
+    S3Wire(
+        true,
+        { bytes: string -> true },
+        { maximum: int ->
+            if (scriptedNext >= scriptedReads.size) ""
+            else {
+                scriptedNext = scriptedNext + 1
+                scriptedReads[scriptedNext - 1]
+            }
+        },
+        { -> }
+    )
+}
+
+fun testWireParsing(): int {
+    if (s3ContentLength("12") != 12 || s3ContentLength("") != -1 ||
+        s3ContentLength("1x") != -1 || s3ContentLength("-1") != -1 ||
+        s3ContentLength("9999999999999999999") != -1) return 500
+
+    // A head split across reads, after an interim response, with body behind it.
+    val wire = scriptedWire([
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200", " OK\r\nContent-Le",
+        "ngth: 5\r\nETag: \"a\"\r\n\r\nhe", "llo", "ignored"
+    ])
+    val head = s3ReadHead(wire)
+    if (!head.received || head.response.status != 200 ||
+        head.response.header("etag") != "\"a\"" || head.bodyStart != "he") return 501
+    val body = s3ReadSmallBody(wire, head, 1024)
+    if (body.body != "hello" || !body.complete || !body.bounded) return 502
+    if (scriptedNext != 4) return 503
+
+    // A connection that ends early, in the head and in the body.
+    if (s3ReadHead(scriptedWire(["HTTP/1.1 200 OK\r\nETag"])).received) return 504
+    if (s3ReadHead(scriptedWire([])).received) return 505
+    val shortWire = scriptedWire(["HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc"])
+    val shortBody = s3ReadSmallBody(shortWire, s3ReadHead(shortWire), 1024)
+    if (shortBody.complete) return 506
+
+    // A head that never ends is abandoned, and so is a body over the limit.
+    val filler = testData(70000)
+    if (s3ReadHead(scriptedWire([filler, filler])).received) return 507
+    val longWire = scriptedWire(["HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\n\r\n", filler, filler])
+    val longBody = s3ReadSmallBody(longWire, s3ReadHead(longWire), 1024)
+    if (longBody.bounded) return 508
+
+    // Chunked, one that is cut off, and one that is invalid.
+    val chunkedWire = scriptedWire(["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab", "c\r\n0\r\n\r\n"])
+    val chunked = s3ReadSmallBody(chunkedWire, s3ReadHead(chunkedWire), 1024)
+    if (chunked.body != "abc" || !chunked.complete) return 509
+    val cutWire = scriptedWire(["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n"])
+    if (s3ReadSmallBody(cutWire, s3ReadHead(cutWire), 1024).complete) return 510
+    val badWire = scriptedWire(["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n"])
+    if (s3ReadSmallBody(badWire, s3ReadHead(badWire), 1024).complete) return 511
+
+    // No framing at all can't be told from a stalled connection.
+    val openWire = scriptedWire(["HTTP/1.1 200 OK\r\n\r\nabc"])
+    if (s3ReadSmallBody(openWire, s3ReadHead(openWire), 1024).complete) return 512
+    0
+}
+
+fun testLowLevel(client: S3Client): int {
+    fakeReset()
+    val started = client.createMultipartUpload("big/low.bin")
+    if (!started.succeeded || started.uploadId != "up/1&2") return 600
+    val first = client.uploadPart("big/low.bin", started.uploadId, 1, "one")
+    if (!first.succeeded || first.etag != "\"part-1\"") return 601
+    if (client.uploadPart("big/low.bin", started.uploadId, 0, "x").succeeded) return 602
+    val done = client.completeMultipartUpload(
+        "big/low.bin", started.uploadId, [S3CompletedPart(1, first.etag)]
+    )
+    if (!done.succeeded || fakeObject != "one") return 603
+    if (client.completeMultipartUpload("big/low.bin", "u", []).succeeded) return 604
+    // Aborting something already gone is fine, so a retry can't fail on it.
+    if (!client.abortMultipartUpload("big/low.bin", "u").succeeded) return 605
+    fakeFaults = ["CREATE 500", "CREATE drop"]
+    val retried = client.createMultipartUpload("big/low.bin")
+    if (!retried.succeeded || retried.result.retries != 2) return 606
+    fakeFaults = ["CREATE 500", "CREATE 500", "CREATE 500"]
+    if (client.createMultipartUpload("big/low.bin").succeeded) return 607
+    0
+}
+
+fun main: int {
+    val directory = Path("/tmp/abla-s3-transfer-test-${linuxProcessId()}")
+    directory.createDirectories()
+    val client = s3ClientWithWire(testConfig(), fakeConnect, testClock, testWait)
+    var failed = testWireParsing()
+    if (failed == 0) failed = testPresigning(client)
+    if (failed == 0) failed = testUploads(client)
+    if (failed == 0) failed = testFiles(client, directory)
+    if (failed == 0) failed = testDownloads(client)
+    if (failed == 0) failed = testLowLevel(client)
+    directory.removeTree()
+    if (failed != 0) eprintln("transfer test failed: $failed")
+    failed
+}

@@ -1,0 +1,190 @@
+// Drives one transfer against a real server for tools/test-transfers.sh, which
+// holds the expectations and compares the bytes with sha256sum. A failed transfer
+// exits 3, so the script can tell it from a crash.
+import "../src/s3.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/memory"
+import "abla/process"
+import "abla/process/time"
+import "abla/sys/linux"
+
+fun toolReport(label: string, result: S3TransferResult): int {
+    eprintln("$label ok=${result.succeeded} bytes=${result.bytes} parts=${result.parts} retries=${result.retries} code=${result.errorCode} status=${result.status} resumed_from=${result.resumedFrom} leftover=${result.leftoverUploadId}")
+    if (result.succeeded) 0 else 3
+}
+
+fun toolIntArgument(index: int): int = s3ParseInt(processArgument(index), 0)
+
+// A real connection that fails on purpose. Object data is what's counted: writes
+// and reads of a size a small request never uses, so that an abort still reaches
+// the server. Each connection may carry TOOL_FAULT_BUDGET bytes, for the first
+// TOOL_FAULT_CONNECTIONS connections that go over it; and past TOOL_FAULT_TOTAL
+// bytes of the whole run, no object data moves at all and no GET is sent.
+var toolBudget: int = 0
+var toolFailing: int = 0
+var toolTotalLimit: int = -1
+var toolTotal: int = 0
+var toolSinkDelay: int = 0
+
+class ToolWireState(var used: int)
+
+fun toolSpend(var state: ToolWireState, bytes: int): bool {
+    toolTotal = toolTotal + bytes
+    if (toolTotalLimit >= 0 && toolTotal > toolTotalLimit) return false
+    if (toolFailing <= 0) return true
+    state.used = state.used + bytes
+    if (state.used > toolBudget) {
+        toolFailing = toolFailing - 1
+        false
+    } else true
+}
+
+fun toolFaultyWrite(var state: ToolWireState, inner: S3Wire, bytes: string): bool {
+    val write = inner.write
+    val refused = toolTotalLimit >= 0 && toolTotal > toolTotalLimit &&
+        bytes.startsWith("GET ")
+    if (refused || (bytes.size > 4096 && !toolSpend(state, bytes.size))) false
+    else write(bytes)
+}
+
+fun toolFaultyRead(var state: ToolWireState, inner: S3Wire, maximum: int): string {
+    val read = inner.read
+    if (maximum > 65536 && !toolSpend(state, 0)) ""
+    else {
+        val bytes = read(maximum)
+        if (maximum > 65536 && !toolSpend(state, bytes.size)) "" else bytes
+    }
+}
+
+fun toolFaultyWire(inner: S3Wire): S3Wire {
+    val state = ToolWireState(0)
+    S3Wire(
+        inner.connected,
+        { bytes: string -> toolFaultyWrite(state, inner, bytes) },
+        { maximum: int -> toolFaultyRead(state, inner, maximum) },
+        inner.close
+    )
+}
+
+fun toolClient(config: S3Config): S3Client = s3ClientWithWire(
+    config,
+    { -> toolFaultyWire(s3OpenWire(config)) },
+    { -> s3NowAmzDate() },
+    { milliseconds: int -> sleep(milliseconds) }
+)
+
+fun toolPeak(): void {
+    val status = linuxReadFile("/proc/self/status", 16384)
+    var begin = 0
+    var index = 0
+    while (index < status.size) {
+        if (status[index] == 10) {
+            val line = status.slice(begin, index)
+            if (line.size > 6 && line.slice(0, 6) == "VmHWM:") eprintln("peak $line")
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    return
+}
+
+fun main: int {
+    val config = s3ConfigFromEnvironment()
+    if (!config.valid()) { eprintln("invalid configuration"); return 2 }
+    val growth = linuxEnvironment("TOOL_COLLECTION_GROWTH")
+    if (growth.found) memorySetCollectionGrowth(s3ParseInt(growth.value, 0))
+    val budget = linuxEnvironment("TOOL_FAULT_BUDGET")
+    if (budget.found) toolBudget = s3ParseInt(budget.value, 0)
+    val failing = linuxEnvironment("TOOL_FAULT_CONNECTIONS")
+    if (failing.found) toolFailing = s3ParseInt(failing.value, 0)
+    val total = linuxEnvironment("TOOL_FAULT_TOTAL")
+    if (total.found) toolTotalLimit = s3ParseInt(total.value, -1)
+    val delay = linuxEnvironment("TOOL_SINK_DELAY_MS")
+    if (delay.found) toolSinkDelay = s3ParseInt(delay.value, 0)
+    val client = toolClient(config)
+    val command = processArgument(0)
+    val key = processArgument(1)
+    val partSize = s3ParseInt(s3Environment("TOOL_PART_BYTES", "16777216"), 16777216)
+    val retries = s3ParseInt(s3Environment("TOOL_RETRIES", "4"), 4)
+    val resume = s3Environment("TOOL_RESUME", "false") == "true"
+    val options = S3TransferOptions(partSize, retries, -1, resume)
+    var code = 0
+    if (command == "upload-file") {
+        code = toolReport(command, client.uploadFile(
+            key, Path(processArgument(2)), "application/octet-stream", options
+        ))
+    } else if (command == "upload-stream") {
+        // Reads standard input, whose size nobody knows, until its end. A
+        // TOOL_SOURCE_FAIL_AT byte count makes the source fail once it has passed.
+        val failAt = s3ParseInt(s3Environment("TOOL_SOURCE_FAIL_AT", "-1"), -1)
+        val input = LinuxFileDescriptor(0)
+        var seen = 0
+        val source = { ->
+            val bytes = input.read(1048576)
+            seen = seen + bytes.size
+            if (failAt >= 0 && seen > failAt) s3ChunkFailed()
+            else if (bytes.size == 0) s3ChunkEnd()
+            else s3Chunk(bytes)
+        }
+        code = toolReport(command, client.uploadStream(
+            key, source, "application/octet-stream", options
+        ))
+    } else if (command == "download-file") {
+        code = toolReport(command, client.downloadFile(
+            key, Path(processArgument(2)), options
+        ))
+    } else if (command == "download-stream") {
+        val sink = { bytes: string ->
+            if (toolSinkDelay > 0) sleep(toolSinkDelay)
+            linuxWriteAll(1, bytes)
+        }
+        code = toolReport(command, client.downloadStream(key, sink, options))
+    } else if (command == "size") {
+        val stored = client.statObject(key)
+        println("${stored.contentLength}")
+        code = if (stored.succeeded) 0 else 3
+    } else if (command == "delete") {
+        code = if (client.deleteObject(key).succeeded) 0 else 3
+    } else if (command == "incomplete") {
+        val listed = client.listMultipartUploads(key)
+        if (!listed.succeeded) {
+            eprintln("listing failed: ${listed.result.errorCode}")
+            return 3
+        }
+        println("${listed.uploads.size}")
+    } else if (command == "sweep") {
+        val sweep = client.abortIncompleteUploads(key)
+        println("${sweep.aborted}")
+        code = if (sweep.succeeded) 0 else 3
+    } else if (command == "presign-get") {
+        println(client.presignGet(key, toolIntArgument(2)).url)
+    } else if (command == "presign-put") {
+        println(client.presignPut(key, toolIntArgument(2)).url)
+    } else if (command == "start") {
+        val started = client.createMultipartUpload(key)
+        println(started.uploadId)
+        code = if (started.succeeded) 0 else 3
+    } else if (command == "presign-part") {
+        println(client.presignUploadPart(
+            key, processArgument(2), toolIntArgument(3), 600
+        ).url)
+    } else if (command == "complete") {
+        val parts: array<S3CompletedPart> = []
+        var index = 3
+        while (processArgument(index) != "") {
+            parts.append(S3CompletedPart(index - 2, processArgument(index)))
+            index = index + 1
+        }
+        val done = client.completeMultipartUpload(key, processArgument(2), parts)
+        if (!done.succeeded) eprintln("complete failed: ${done.errorCode}")
+        code = if (done.succeeded) 0 else 3
+    } else if (command == "abort") {
+        code = if (client.abortMultipartUpload(key, processArgument(2)).succeeded) 0 else 3
+    } else {
+        eprintln("unknown command")
+        code = 2
+    }
+    toolPeak()
+    code
+}

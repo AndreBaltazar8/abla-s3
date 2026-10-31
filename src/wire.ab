@@ -1,0 +1,194 @@
+import "abla/bytes"
+import "abla/dns"
+import "abla/http"
+import "abla/net"
+import "abla/sys/linux"
+import "abla/tls/hosted"
+import "abla/unsafe/memory"
+import "config.ab"
+
+// One connection for one streaming request. The whole-object transport takes
+// and returns complete bodies; a wire moves a body piece by piece. A read
+// returns "" once the peer has closed, failed, or stalled past the timeout.
+class S3Wire(
+    val connected: bool,
+    val write: (string) -> bool,
+    val read: (int) -> string,
+    val close: () -> void
+)
+
+fun s3NoWire(): S3Wire = S3Wire(
+    false,
+    { bytes: string -> false },
+    { maximum: int -> "" },
+    { -> }
+)
+
+// A socket option bounds each blocking read and write, which covers OpenSSL's
+// as well: the TLS adapter has no timeouts of its own once it is connected.
+private fun s3SetSocketTimeouts(descriptor: int, milliseconds: int): void {
+    val interval = nativeByteBuffer(16)
+    interval.storeI64(0, milliseconds / 1000)
+    interval.storeI64(8, (milliseconds - milliseconds / 1000 * 1000) * 1000)
+    linuxSyscall5(54, descriptor, 1, 20, nativePointerAddress(interval.address), 16)
+    linuxSyscall5(54, descriptor, 1, 21, nativePointerAddress(interval.address), 16)
+    interval.close()
+    return
+}
+
+// OpenSSL writes with write(2), so a peer that resets during an upload would
+// otherwise raise SIGPIPE and end the process. The mask is per thread.
+private fun s3BlockBrokenPipe(): void {
+    val signals = nativeByteBuffer(8)
+    signals.storeI64(0, 4096)
+    linuxSyscall4(14, 0, nativePointerAddress(signals.address), 0, 8)
+    signals.close()
+    return
+}
+
+private fun s3TcpWire(descriptor: int): S3Wire = S3Wire(
+    true,
+    { bytes: string ->
+        var connection = TcpConnection(descriptor)
+        val written = connection.writeResult(bytes).succeeded()
+        connection.descriptor = -1
+        written
+    },
+    { maximum: int ->
+        var connection = TcpConnection(descriptor)
+        val bytes = connection.read(maximum)
+        connection.descriptor = -1
+        bytes
+    },
+    { ->
+        linuxTcpCloseDescriptor(descriptor)
+        return
+    }
+)
+
+private fun s3TlsWire(handle: int): S3Wire = S3Wire(
+    true,
+    { bytes: string ->
+        var connection = TlsConnection(handle)
+        val written = connection.write(bytes) == bytes.size
+        connection.handle = -1
+        written
+    },
+    { maximum: int ->
+        var connection = TlsConnection(handle)
+        val bytes = connection.read(maximum)
+        connection.handle = -1
+        bytes
+    },
+    { ->
+        tlsCloseHandle(handle)
+        return
+    }
+)
+
+fun s3OpenWire(config: S3Config): S3Wire {
+    val host = s3RequestHost(config)
+    // TLS's own connector also special-cases this name, for the same reason:
+    // a local endpoint must not depend on DNS.
+    val address = if (host == "localhost") "127.0.0.1" else host
+    var connection = tcpConnectHost(
+        address, config.port, s3TransportTimeout(config.timeoutMilliseconds)
+    )
+    if (connection.descriptor < 0) return s3NoWire()
+    s3SetSocketTimeouts(connection.descriptor, config.timeoutMilliseconds)
+    if (config.useTls) {
+        s3BlockBrokenPipe()
+        var secured = tlsUpgrade(connection, host)
+        val handle = secured.handle
+        secured.handle = -1
+        if (handle < 0) s3NoWire() else s3TlsWire(handle)
+    } else {
+        val descriptor = connection.descriptor
+        connection.descriptor = -1
+        s3TcpWire(descriptor)
+    }
+}
+
+// -1 for anything that isn't a plain decimal length.
+fun s3ContentLength(value: string): int {
+    var valid = value.size > 0 && value.size <= 18
+    var result = 0
+    var index = 0
+    while (valid && index < value.size) {
+        if (value[index] < 48 || value[index] > 57) valid = false
+        else result = result * 10 + value[index] - 48
+        index = index + 1
+    }
+    if (valid) result else -1
+}
+
+// A response's status and headers, plus the body bytes that arrived with them.
+class S3WireHead(
+    val received: bool,
+    val response: HttpResponse,
+    val bodyStart: string
+)
+
+fun s3ReadHead(wire: S3Wire): S3WireHead {
+    val read = wire.read
+    var input = ""
+    var head = S3WireHead(false, HttpResponse(0, [], ""), "")
+    var reading = true
+    while (reading) {
+        val chunk = read(65536)
+        if (chunk.size == 0) reading = false
+        input = "$input$chunk"
+        val end = httpHeaderEnd(input)
+        if (end >= 0) {
+            val parsed = httpParseResponseBounded(input.slice(0, end), 0).response
+            val rest = input.slice(end, input.size)
+            // Interim responses such as 100 Continue precede the real one.
+            if (parsed.status >= 100 && parsed.status < 200) input = rest
+            else {
+                if (parsed.status >= 200) head = S3WireHead(true, parsed, rest)
+                reading = false
+            }
+        } else if (input.size > 65536) reading = false
+    }
+    head
+}
+
+class S3WireBody(val body: string, val complete: bool, val bounded: bool)
+
+// The rest of a small response, such as an XML result or an S3 error. Reading
+// stops at the response's own framing, so a server that keeps the connection
+// open or sends keep-alive whitespace can't stall a finished response.
+fun s3ReadSmallBody(wire: S3Wire, head: S3WireHead, maximum: int): S3WireBody {
+    val read = wire.read
+    val response = head.response
+    val framedLength = s3ContentLength(response.header("Content-Length"))
+    val chunked = httpCoreHeaderTokenContains(
+        response.header("Transfer-Encoding"), "chunked"
+    )
+    var input = head.bodyStart
+    var finished = false
+    var bounded = true
+    while (!finished) {
+        if (chunked) {
+            val decoded = httpCoreDecodeChunked(input, maximum)
+            if (decoded.complete || !decoded.valid) finished = true
+        } else if (framedLength >= 0 && input.size >= framedLength) finished = true
+        if (input.size > maximum + 65536) {
+            finished = true
+            bounded = false
+        }
+        if (!finished) {
+            val chunk = read(65536)
+            if (chunk.size == 0) finished = true
+            input = "$input$chunk"
+        }
+    }
+    if (chunked) {
+        val decoded = httpCoreDecodeChunked(input, maximum)
+        S3WireBody(decoded.body, decoded.complete && decoded.valid, bounded)
+    } else if (framedLength >= 0) S3WireBody(
+        if (input.size > framedLength) input.slice(0, framedLength) else input,
+        input.size >= framedLength,
+        bounded && framedLength <= maximum
+    ) else S3WireBody(input, false, bounded)
+}

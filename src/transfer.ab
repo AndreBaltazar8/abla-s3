@@ -1,0 +1,539 @@
+import "abla/fs"
+import "abla/memory"
+import "abla/http"
+import "abla/sys/linux"
+import "config.ab"
+import "signing.ab"
+import "wire.ab"
+import "client.ab"
+import "multipart.ab"
+
+class S3TransferOptions(
+    // Rounded up for a file that wouldn't otherwise fit in 10,000 parts. A chunk
+    // source holds one part in memory; a file holds at most 1 MiB of one.
+    val partSizeBytes: int = 16777216,
+    val maximumRetries: int = 4,
+    // A chunk source's expected total, when known, sizes its parts the same way.
+    val expectedSizeBytes: int = -1,
+    // downloadFile: keep what arrived after a failure, and continue from it.
+    val resume: bool = false
+)
+
+class S3TransferResult(
+    val succeeded: bool,
+    val bytes: int,
+    val parts: int,
+    val etag: string,
+    val versionId: string,
+    val requestId: string,
+    val status: int,
+    val errorCode: string,
+    val errorMessage: string,
+    val retries: int,
+    // Non-empty only when a failed upload could not be aborted and is still
+    // stored (and billed): retry abortMultipartUpload with it.
+    val leftoverUploadId: string,
+    // downloadFile with `resume`: how many bytes were already there.
+    val resumedFrom: int = 0
+)
+
+// What a chunk source returns: bytes (more may follow), the end, or a failure,
+// which abandons the upload rather than storing a truncated object.
+class S3Chunk(val bytes: string, val finished: bool, val failed: bool)
+
+fun s3Chunk(bytes: string): S3Chunk = S3Chunk(bytes, false, false)
+fun s3ChunkEnd(): S3Chunk = S3Chunk("", true, false)
+fun s3ChunkFailed(): S3Chunk = S3Chunk("", false, true)
+
+fun s3TransferFailure(
+    code: string,
+    bytes: int = 0,
+    parts: int = 0,
+    status: int = 0,
+    message: string = "",
+    requestId: string = "",
+    retries: int = 0,
+    leftoverUploadId: string = ""
+): S3TransferResult = S3TransferResult(
+    false, bytes, parts, "", "", requestId, status, code,
+    if (message == "") code else message, retries, leftoverUploadId
+)
+
+fun s3ResultFailure(
+    result: S3Result,
+    bytes: int,
+    parts: int,
+    retries: int,
+    leftoverUploadId: string = ""
+): S3TransferResult = s3TransferFailure(
+    result.errorCode, bytes, parts, result.status, result.errorMessage,
+    result.requestId, retries, leftoverUploadId
+)
+
+fun S3TransferOptions.problem(): string =
+    if (this.partSizeBytes < s3MinimumPartBytes() ||
+        this.partSizeBytes > s3MaximumPartBytes()) "invalid_part_size"
+    else if (this.maximumRetries < 0 || this.maximumRetries > 20) "invalid_retries"
+    else ""
+
+// The smallest allowed part size that fits `total` bytes in 10,000 parts.
+fun s3PartSizeFor(requested: int, total: int): int {
+    val needed = total / s3MaximumParts() +
+        (if (total % s3MaximumParts() == 0) 0 else 1)
+    if (needed > requested) needed else requested
+}
+
+// One upload in progress. It starts the multipart upload only when a second part
+// proves it is needed, so an object that fits in one part is one plain PUT.
+class S3Upload(
+    val client: S3Client,
+    val key: string,
+    val contentType: string,
+    val options: S3TransferOptions,
+    var uploadId: string,
+    val completed: array<S3CompletedPart>,
+    var bytes: int,
+    var retries: int
+)
+
+fun S3Upload.abortWith(result: S3Result): S3TransferResult {
+    var leftover = ""
+    if (this.uploadId != "") {
+        val aborted = this.client.abortMultipartUpload(this.key, this.uploadId)
+        if (!aborted.succeeded) leftover = this.uploadId
+    }
+    s3ResultFailure(result, this.bytes, this.completed.size, this.retries, leftover)
+}
+
+fun S3Upload.abortWithCode(code: string): S3TransferResult =
+    this.abortWith(s3InvalidResult(code))
+
+// Sends the next part; null means it went well.
+fun S3Upload.sendNext(var body: S3RequestBody): S3TransferResult? {
+    if (this.uploadId == "") {
+        val started = this.client.createMultipartUpload(this.key, this.contentType)
+        this.retries = this.retries + started.result.retries
+        if (!started.succeeded) return this.abortWith(started.result)
+        this.uploadId = started.uploadId
+    }
+    if (this.completed.size >= s3MaximumParts())
+        return this.abortWithCode("too_many_parts")
+    val number = this.completed.size + 1
+    val sent = this.client.sendPart(
+        this.key, this.uploadId, number, body, this.options.maximumRetries
+    )
+    this.retries = this.retries + sent.retries
+    if (body.sourceFailed) return this.abortWithCode("source_read_failed")
+    if (!sent.succeeded) return this.abortWith(sent)
+    this.completed.append(S3CompletedPart(number, sent.etag))
+    this.bytes = this.bytes + body.size
+    null
+}
+
+// An object that fits in one part needs no upload to clean up afterwards.
+fun S3Upload.putWhole(var body: S3RequestBody): S3TransferResult {
+    val wait = this.client.wait
+    val extras = [S3Header("content-type", this.contentType)]
+    var attempts = 0
+    var result = this.client.sendOnce(
+        "PUT", this.key, "", body, extras, "UNSIGNED-PAYLOAD"
+    )
+    while (!result.succeeded && !body.sourceFailed &&
+        s3RetryableResult(result) && attempts < this.options.maximumRetries) {
+        wait(s3RetryDelay(attempts))
+        attempts = attempts + 1
+        result = this.client.sendOnce(
+            "PUT", this.key, "", body, extras, "UNSIGNED-PAYLOAD"
+        )
+    }
+    this.retries = this.retries + attempts
+    if (body.sourceFailed) return s3TransferFailure(
+        "source_read_failed", 0, 0, 0, "", "", this.retries
+    )
+    if (!result.succeeded) return s3ResultFailure(result, 0, 0, this.retries)
+    this.bytes = body.size
+    this.verified(result.etag, result.versionId, result.requestId, 1)
+}
+
+// The object now exists: a failure here reports a problem but aborts nothing.
+fun S3Upload.verified(
+    etag: string,
+    versionId: string,
+    requestId: string,
+    parts: int
+): S3TransferResult {
+    val stored = this.client.statObject(this.key)
+    if (!stored.succeeded)
+        return s3ResultFailure(stored, this.bytes, parts, this.retries)
+    if (stored.contentLength != this.bytes) return s3TransferFailure(
+        "size_mismatch", this.bytes, parts, stored.status,
+        "stored ${stored.contentLength} bytes, sent ${this.bytes}",
+        stored.requestId, this.retries
+    )
+    S3TransferResult(
+        true, this.bytes, parts, etag, versionId, requestId, stored.status,
+        "", "", this.retries, ""
+    )
+}
+
+fun S3Upload.finish(): S3TransferResult {
+    val done = this.client.completeMultipartUpload(
+        this.key, this.uploadId, this.completed
+    )
+    this.retries = this.retries + done.retries
+    if (done.succeeded) return this.verified(
+        done.etag, done.versionId, done.requestId, this.completed.size
+    )
+    // A complete whose response was lost and that is then retried finds the
+    // upload gone. Only a complete or an abort removes one, and nothing aborted.
+    if (done.errorCode == "NoSuchUpload" && done.retries > 0) {
+        val stored = this.client.statObject(this.key)
+        if (stored.succeeded && stored.contentLength == this.bytes)
+            return this.verified(
+                stored.etag, stored.versionId, stored.requestId,
+                this.completed.size
+            )
+    }
+    this.abortWith(done)
+}
+
+// Uploads a regular file of any size. The file must not change while it is read:
+// any change abandons the upload.
+fun S3Client.uploadFile(
+    key: string,
+    source: Path,
+    contentType: string = "application/octet-stream",
+    options: S3TransferOptions = S3TransferOptions()
+): S3TransferResult {
+    if (!this.config.valid()) return s3TransferFailure("invalid_configuration")
+    if (!s3KeyValid(key)) return s3TransferFailure("invalid_object_key")
+    if (options.problem() != "") return s3TransferFailure(options.problem())
+    val before = source.info()
+    if (!before.isFile()) return s3TransferFailure("source_not_a_file")
+    val file = linuxOpen(source.text)
+    if (file.descriptor < 0) return s3TransferFailure("source_read_failed")
+    val partSize = s3PartSizeFor(options.partSizeBytes, before.size)
+    if (partSize > s3MaximumPartBytes()) {
+        file.close()
+        return s3TransferFailure("object_too_large")
+    }
+    val upload = S3Upload(this, key, contentType, options, "", [], 0, 0)
+    var result: S3TransferResult? = null
+    if (before.size <= partSize) {
+        var whole = S3RequestBody(before.size, [], file.descriptor, 0)
+        result = upload.putWhole(whole)
+    } else {
+        var offset = 0
+        while (result == null && offset < before.size) {
+            val remaining = before.size - offset
+            val size = if (remaining < partSize) remaining else partSize
+            var part = S3RequestBody(size, [], file.descriptor, offset)
+            result = upload.sendNext(part)
+            offset = offset + size
+        }
+        if (result == null) {
+            val after = source.info()
+            result = if (after.size != before.size ||
+                after.revision != before.revision)
+                upload.abortWithCode("source_changed")
+            else upload.finish()
+        }
+    }
+    file.close()
+    val finished = result
+    if (finished != null) finished else s3TransferFailure("internal_error")
+}
+
+// Bytes a chunk source has handed over that the next part still has to take.
+class S3ChunkReader(
+    var pending: string,
+    var pendingOffset: int,
+    var ended: bool,
+    var failed: bool
+)
+
+// Fills one part. The pieces are kept as they arrived, so nothing is copied and
+// a retry sends the same strings again.
+fun s3ReadPart(
+    var source: FnMut() -> S3Chunk,
+    var reader: S3ChunkReader,
+    partSize: int
+): S3RequestBody {
+    val pieces: array<string> = []
+    var size = 0
+    while (size < partSize && !reader.failed &&
+        (!reader.ended || reader.pendingOffset < reader.pending.size)) {
+        if (reader.pendingOffset < reader.pending.size) {
+            val available = reader.pending.size - reader.pendingOffset
+            val wanted = partSize - size
+            if (reader.pendingOffset == 0 && available <= wanted) {
+                pieces.append(reader.pending)
+                size = size + available
+                reader.pendingOffset = available
+            } else {
+                val taken = if (available < wanted) available else wanted
+                pieces.append(reader.pending.slice(
+                    reader.pendingOffset, reader.pendingOffset + taken
+                ))
+                size = size + taken
+                reader.pendingOffset = reader.pendingOffset + taken
+            }
+            if (reader.pendingOffset >= reader.pending.size) {
+                reader.pending = ""
+                reader.pendingOffset = 0
+            }
+        } else {
+            val next = source()
+            if (next.failed) reader.failed = true
+            else if (next.finished) reader.ended = true
+            else {
+                reader.pending = next.bytes
+                reader.pendingOffset = 0
+            }
+        }
+    }
+    s3MemoryBody(pieces)
+}
+
+// Uploads whatever `source` produces, without knowing its size. Chunks may be any
+// size; memory holds one part, plus whatever a too-large chunk still holds.
+fun S3Client.uploadStream(
+    key: string,
+    var source: FnMut() -> S3Chunk,
+    contentType: string = "application/octet-stream",
+    options: S3TransferOptions = S3TransferOptions()
+): S3TransferResult {
+    if (!this.config.valid()) return s3TransferFailure("invalid_configuration")
+    if (!s3KeyValid(key)) return s3TransferFailure("invalid_object_key")
+    if (options.problem() != "") return s3TransferFailure(options.problem())
+    val partSize = if (options.expectedSizeBytes > 0)
+        s3PartSizeFor(options.partSizeBytes, options.expectedSizeBytes)
+        else options.partSizeBytes
+    if (partSize > s3MaximumPartBytes()) return s3TransferFailure("object_too_large")
+    // Reaching the runtime's memory limit is a panic, not an error to report.
+    if (partSize >= memoryLimit() / 2) return s3TransferFailure("part_exceeds_memory_limit")
+    val upload = S3Upload(this, key, contentType, options, "", [], 0, 0)
+    var reader = S3ChunkReader("", 0, false, false)
+    var result: S3TransferResult? = null
+    var first = true
+    while (result == null && !reader.ended) {
+        var body = s3ReadPart(source, reader, partSize)
+        if (reader.failed) {
+            result = upload.abortWithCode("source_failed")
+        } else if (first && reader.ended) {
+            result = upload.putWhole(body)
+        } else if (body.size > 0) {
+            result = upload.sendNext(body)
+        }
+        first = false
+    }
+    val failed = result
+    if (failed != null) failed else upload.finish()
+}
+
+private fun s3ContentRangeMatches(
+    value: string,
+    first: int,
+    last: int,
+    total: int
+): bool = value == "bytes $first-$last/$total"
+
+// Writes the bytes from `start` to the sink in order, reconnecting after a failure
+// and asking only for what hasn't arrived. Nothing is delivered twice, the retry
+// count restarts whenever bytes arrive, and If-Match stops a transfer that would
+// otherwise splice two versions of an object together.
+fun S3Client.streamRange(
+    key: string,
+    var sink: FnMut(string) -> bool,
+    start: int,
+    total: int,
+    etag: string,
+    maximumRetries: int
+): S3TransferResult {
+    val wait = this.wait
+    val clock = this.clock
+    val connect = this.connect
+    val path = this.objectPath(key)
+    var offset = start
+    var failures = 0
+    var retries = 0
+    var failure: S3TransferResult? = null
+    while (failure == null && offset < total) {
+        val extras = [S3Header("range", "bytes=$offset-${total - 1}")]
+        if (etag != "") extras.append(S3Header("if-match", etag))
+        val signed = s3SignRequest(
+            this.config, "GET", path, "", "", clock(), extras
+        )
+        if (!signed.succeeded)
+            return s3TransferFailure(signed.error, offset - start, 0, 0, "", "", retries)
+        val attemptStart = offset
+        var lastError = "transport_failed"
+        var lastStatus = 0
+        val wire = connect()
+        if (wire.connected) {
+            val write = wire.write
+            val read = wire.read
+            val close = wire.close
+            val requested = write(
+                httpRequest("GET", path, "", signed.headers)
+                    .renderForClient(s3Authority(this.config))
+            )
+            val head = if (requested) s3ReadHead(wire)
+                else S3WireHead(false, HttpResponse(0, [], ""), "")
+            val response = head.response
+            lastStatus = response.status
+            if (!head.received) lastError = "incomplete_response"
+            else if (response.status == 206 || response.status == 200) {
+                val remaining = total - offset
+                val framed = s3ContentLength(response.header("Content-Length"))
+                val exact = if (response.status == 206) s3ContentRangeMatches(
+                    response.header("Content-Range"), offset, total - 1, total
+                ) else offset == 0
+                val sameObject = etag == "" || response.header("ETag") == "" ||
+                    response.header("ETag") == etag
+                if (!sameObject) failure = s3TransferFailure(
+                    "object_changed", offset - start, 0, response.status, "",
+                    response.header("x-amz-request-id"), retries
+                ) else if (!exact || framed != remaining) failure = s3TransferFailure(
+                    "invalid_response_range", offset - start, 0, response.status,
+                    "", response.header("x-amz-request-id"), retries
+                ) else {
+                    var bytes = head.bodyStart
+                    var receiving = true
+                    while (receiving) {
+                        val left = total - offset
+                        if (bytes.size > left) bytes = bytes.slice(0, left)
+                        if (bytes.size > 0) {
+                            if (!sink(bytes)) {
+                                failure = s3TransferFailure(
+                                    "sink_failed", offset - start, 0, 0, "", "", retries
+                                )
+                                receiving = false
+                            } else offset = offset + bytes.size
+                        }
+                        if (receiving && offset < total) {
+                            val wanted = total - offset
+                            bytes = read(if (wanted < 262144) wanted else 262144)
+                            if (bytes.size == 0) {
+                                receiving = false
+                                lastError = "incomplete_response"
+                            }
+                        } else receiving = false
+                    }
+                }
+            } else {
+                val rest = s3ReadSmallBody(wire, head, 1048576)
+                val document = xmlErrorDocument(rest.body)
+                val code = if (document != "") document else "s3_error"
+                lastError = code
+                val retryable = s3RetryableStatus(response.status) ||
+                    code == "RequestTimeout"
+                if (!retryable) failure = s3TransferFailure(
+                    if (response.status == 412) "object_changed" else code,
+                    offset - start, 0, response.status, "",
+                    response.header("x-amz-request-id"), retries
+                )
+            }
+            close()
+        }
+        if (failure == null && offset < total) {
+            failures = if (offset > attemptStart) 0 else failures + 1
+            if (failures > maximumRetries) failure = s3TransferFailure(
+                lastError, offset - start, 0, lastStatus, "", "", retries
+            ) else {
+                wait(s3RetryDelay(failures))
+                retries = retries + 1
+            }
+        }
+    }
+    val failed = failure
+    if (failed != null) failed else S3TransferResult(
+        true, offset - start, 0, etag, "", "", 200, "", "", retries, ""
+    )
+}
+
+// Delivers an object to `sink` in order, in pieces of at most 256 KiB. A false
+// from the sink stops the transfer. Size and version are checked throughout.
+fun S3Client.downloadStream(
+    key: string,
+    var sink: FnMut(string) -> bool,
+    options: S3TransferOptions = S3TransferOptions()
+): S3TransferResult {
+    if (!this.config.valid()) return s3TransferFailure("invalid_configuration")
+    if (!s3KeyValid(key)) return s3TransferFailure("invalid_object_key")
+    if (options.problem() != "") return s3TransferFailure(options.problem())
+    val stored = this.statObject(key)
+    if (!stored.succeeded) return s3ResultFailure(stored, 0, 0, stored.retries)
+    if (stored.contentLength < 0) return s3TransferFailure("missing_content_length")
+    this.streamRange(
+        key, sink, 0, stored.contentLength, stored.etag, options.maximumRetries
+    )
+}
+
+private fun s3RemoveQuietly(target: Path): void {
+    if (target.exists()) target.remove()
+    return
+}
+
+// Downloads to `target`, which appears only once complete, verified, and synced;
+// until then the bytes are in `<target>.s3part`, readable only by this user. With
+// `options.resume` a failed download keeps that file, and a later call continues
+// from it if the object's size and ETag still match.
+fun S3Client.downloadFile(
+    key: string,
+    target: Path,
+    options: S3TransferOptions = S3TransferOptions()
+): S3TransferResult {
+    if (!this.config.valid()) return s3TransferFailure("invalid_configuration")
+    if (!s3KeyValid(key)) return s3TransferFailure("invalid_object_key")
+    if (options.problem() != "") return s3TransferFailure(options.problem())
+    val stored = this.statObject(key)
+    if (!stored.succeeded) return s3ResultFailure(stored, 0, 0, stored.retries)
+    val total = stored.contentLength
+    if (total < 0) return s3TransferFailure("missing_content_length")
+    if (!target.createParentDirectories())
+        return s3TransferFailure("target_write_failed")
+    val partial = Path("${target.text}.s3part")
+    val marker = Path("${target.text}.s3part.meta")
+    val identity = "${stored.etag}\n$total\n"
+    var start = 0
+    if (options.resume && stored.etag != "" && partial.info().isFile() &&
+        marker.exists() && marker.readText() == identity &&
+        partial.info().size <= total) start = partial.info().size
+    // O_WRONLY | O_CREAT, then O_APPEND to continue or O_TRUNC to begin again.
+    val file = linuxOpen(
+        partial.text, if (start > 0) 1089 else 577, 384
+    )
+    if (file.descriptor < 0) return s3TransferFailure("target_write_failed")
+    if (options.resume && start == 0 && !marker.writeText(identity)) {
+        file.close()
+        return s3TransferFailure("target_write_failed")
+    }
+    val descriptor = file.descriptor
+    val result = this.streamRange(
+        key, { bytes: string -> linuxWriteAll(descriptor, bytes) },
+        start, total, stored.etag, options.maximumRetries
+    )
+    val synced = !result.succeeded || linuxSyscall1(74, descriptor) == 0
+    file.close()
+    if (!result.succeeded || !synced) {
+        if (!options.resume) s3RemoveQuietly(partial)
+        return if (synced) result else s3TransferFailure("target_write_failed", result.bytes)
+    }
+    if (partial.info().size != total) {
+        s3RemoveQuietly(partial)
+        s3RemoveQuietly(marker)
+        return s3TransferFailure("size_mismatch", result.bytes)
+    }
+    if (!partial.moveTo(target)) return s3TransferFailure("target_write_failed", result.bytes)
+    s3RemoveQuietly(marker)
+    val directory = linuxOpen(target.parent().text)
+    if (directory.descriptor >= 0) {
+        linuxSyscall1(74, directory.descriptor)
+        directory.close()
+    }
+    S3TransferResult(
+        true, total, 0, stored.etag, stored.versionId, stored.requestId, 200,
+        "", "", result.retries, "", start
+    )
+}

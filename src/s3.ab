@@ -1,5 +1,8 @@
 import "config.ab"
 import "signing.ab"
+import "wire.ab"
 import "client.ab"
+import "multipart.ab"
+import "transfer.ab"
 
 fun s3PackageVersion(): string = "0.1.0"

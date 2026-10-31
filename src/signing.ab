@@ -163,6 +163,42 @@ fun s3ObjectPath(config: S3Config, key: string): string {
     else "/$encoded"
 }
 
+fun s3SigningKey(config: S3Config, shortDate: string): string {
+    val dateKey = hmacSha256("AWS4${config.secretAccessKey}", shortDate)
+    val regionKey = hmacSha256(dateKey, config.regionName)
+    val serviceKey = hmacSha256(regionKey, "s3")
+    hmacSha256(serviceKey, "aws4_request")
+}
+
+// Encodes and sorts query parameters the way Signature Version 4 canonicalizes
+// them, which is also a valid request query.
+fun s3CanonicalQuery(names: array<string>, values: array<string>): string {
+    val pairs: array<string> = []
+    var index = 0
+    while (index < names.size) {
+        pairs.append("${s3UriEncode(names[index])}=${s3UriEncode(values[index])}")
+        index = index + 1
+    }
+    var outer = 1
+    while (outer < pairs.size) {
+        val pair = pairs[outer]
+        var inner = outer
+        while (inner > 0 && s3StringCompare(pair, pairs[inner - 1]) < 0) {
+            pairs[inner] = pairs[inner - 1]
+            inner = inner - 1
+        }
+        pairs[inner] = pair
+        outer = outer + 1
+    }
+    var query = ""
+    index = 0
+    while (index < pairs.size) {
+        query = if (index == 0) pairs[index] else "$query&${pairs[index]}"
+        index = index + 1
+    }
+    query
+}
+
 fun s3SignRequest(
     config: S3Config,
     method: string,
@@ -170,15 +206,17 @@ fun s3SignRequest(
     canonicalQuery: string,
     body: string,
     amzDate: string,
-    extraHeaders: array<S3Header> = []
+    extraHeaders: array<S3Header> = [],
+    payloadOverride: string = ""
 ): S3Signature {
     if (!config.valid()) return s3SigningFailure("invalid_configuration")
     if (!(method == "GET" || method == "PUT" || method == "HEAD" ||
-          method == "DELETE")) return s3SigningFailure("invalid_method")
+          method == "DELETE" || method == "POST")) return s3SigningFailure("invalid_method")
     if (canonicalUri.size == 0 || canonicalUri[0] != 47 ||
         amzDate.size != 16 || amzDate[8] != 84 || amzDate[15] != 90)
         return s3SigningFailure("invalid_request")
-    val payloadHash = hexEncode(sha256(body))
+    val payloadHash = if (payloadOverride != "") payloadOverride
+        else hexEncode(sha256(body))
     val names: array<string> = [
         "host", "x-amz-content-sha256", "x-amz-date"
     ]
@@ -232,15 +270,73 @@ fun s3SignRequest(
     val scope = "$shortDate/${config.regionName}/s3/aws4_request"
     val canonicalHash = hexEncode(sha256(canonicalRequest))
     val stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$scope\n$canonicalHash"
-    val dateKey = hmacSha256("AWS4${config.secretAccessKey}", shortDate)
-    val regionKey = hmacSha256(dateKey, config.regionName)
-    val serviceKey = hmacSha256(regionKey, "s3")
-    val signingKey = hmacSha256(serviceKey, "aws4_request")
-    val signature = hexEncode(hmacSha256(signingKey, stringToSign))
+    val signature = hexEncode(
+        hmacSha256(s3SigningKey(config, shortDate), stringToSign)
+    )
     val authorization = "AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/$scope,SignedHeaders=$signedHeaders,Signature=$signature"
     requestHeaders.append(HttpHeader("Authorization", authorization))
     S3Signature(
         true, "", authorization, canonicalRequest, stringToSign,
         signedHeaders, signature, requestHeaders
+    )
+}
+
+class S3PresignedUrl(
+    val succeeded: bool,
+    val error: string,
+    val url: string,
+    val expiresSeconds: int
+)
+
+// Query-string authentication: whoever holds the URL can make this one request
+// until it expires, without credentials. S3 accepts at most seven days.
+fun s3PresignRequest(
+    config: S3Config,
+    method: string,
+    canonicalUri: string,
+    amzDate: string,
+    expiresSeconds: int,
+    queryNames: array<string> = [],
+    queryValues: array<string> = []
+): S3PresignedUrl {
+    if (!config.valid())
+        return S3PresignedUrl(false, "invalid_configuration", "", 0)
+    if (expiresSeconds < 1 || expiresSeconds > 604800)
+        return S3PresignedUrl(false, "invalid_expiry", "", 0)
+    if (!(method == "GET" || method == "PUT" || method == "HEAD" ||
+          method == "DELETE"))
+        return S3PresignedUrl(false, "invalid_method", "", 0)
+    val shortDate = amzDate.slice(0, 8)
+    val scope = "$shortDate/${config.regionName}/s3/aws4_request"
+    val names: array<string> = [
+        "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+        "X-Amz-SignedHeaders"
+    ]
+    val values: array<string> = [
+        "AWS4-HMAC-SHA256", "${config.accessKeyId}/$scope", amzDate,
+        "$expiresSeconds", "host"
+    ]
+    if (config.sessionToken != "") {
+        names.append("X-Amz-Security-Token")
+        values.append(config.sessionToken)
+    }
+    var index = 0
+    while (index < queryNames.size) {
+        names.append(queryNames[index])
+        values.append(queryValues[index])
+        index = index + 1
+    }
+    val query = s3CanonicalQuery(names, values)
+    val authority = s3Authority(config)
+    val canonicalRequest = "$method\n$canonicalUri\n$query\nhost:$authority\n\nhost\nUNSIGNED-PAYLOAD"
+    val stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$scope\n${hexEncode(sha256(canonicalRequest))}"
+    val signature = hexEncode(
+        hmacSha256(s3SigningKey(config, shortDate), stringToSign)
+    )
+    val scheme = if (config.useTls) "https" else "http"
+    S3PresignedUrl(
+        true, "",
+        "$scheme://$authority$canonicalUri?$query&X-Amz-Signature=$signature",
+        expiresSeconds
     )
 }
