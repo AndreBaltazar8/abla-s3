@@ -7,6 +7,8 @@ BUILD_DIR ?= $(PROJECT_DIR)/build
 HASH := \#
 NIXPKGS_SOURCE ?= $(shell nix eval --raw nixpkgs$(HASH)path)
 NIXPKGS_IMPORT := -I nixpkgs=$(NIXPKGS_SOURCE)
+# CI's released compiler builds programs that run outside the Nix shell, not in it.
+INTEGRATION_SHELL ?= nix-shell $(NIXPKGS_IMPORT) $(ABLAC_DIR)/shell.nix --run
 
 .PHONY: check test test-in-shell integration integration-in-shell clean
 
@@ -37,7 +39,7 @@ test-in-shell: check
 
 integration: check
 	@seaweedfs_path=$$(nix-build $(NIXPKGS_IMPORT) '<nixpkgs>' -A seaweedfs --no-out-link); \
-		PATH=$$seaweedfs_path/bin:$$PATH $(MAKE) integration-in-shell
+		$(INTEGRATION_SHELL) "PATH=$$seaweedfs_path/bin:\$$PATH $(MAKE) integration-in-shell"
 
 integration-in-shell:
 	bash tools/test-s3.sh $(BUILD_DIR)/integration-test
