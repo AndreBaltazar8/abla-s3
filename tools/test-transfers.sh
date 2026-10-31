@@ -129,6 +129,23 @@ big_sha=$(sha256sum <"$big" | cut -d' ' -f1)
 big_size=$(stat -c %s "$big")
 echo "     size $big_size sha256 $big_sha"
 
+# SeaweedFS splits a single PUT into chunks from 4 MiB up, and then refuses
+# If-Match with the object's own ETag.
+echo "== single PUTs around the chunk size"
+for mib in 1 4 5 8 9 16; do
+    head -c $((mib * 1048576)) "$big" >"$work/small.bin"
+    small_sha=$(sha256sum <"$work/small.bin" | cut -d' ' -f1)
+    "$tool" upload-file "small/$mib.bin" "$work/small.bin" 2>"$work/log"
+    check "$mib MiB uploads in one PUT" grep -q 'ok=true .*parts=1 ' "$work/log"
+    "$tool" download-stream "small/$mib.bin" 2>"$work/log" >"$work/small-back.bin"
+    check "$mib MiB download-stream succeeds" grep -q 'ok=true' "$work/log"
+    check "$mib MiB stream has the same sha256" same_sha "$work/small-back.bin" "$small_sha"
+    "$tool" download-file "small/$mib.bin" "$work/small-back.bin" 2>"$work/log"
+    check "$mib MiB download-file has the same sha256" same_sha "$work/small-back.bin" "$small_sha"
+    "$tool" delete "small/$mib.bin" 2>/dev/null
+done
+find "$work/small.bin" "$work/small-back.bin" -delete
+
 echo "== upload and download a file"
 start=$SECONDS
 timed "$work/time" "$tool" upload-file big/file.bin "$big" 2>"$work/log"

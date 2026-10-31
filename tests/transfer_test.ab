@@ -27,7 +27,8 @@ var fakeWiresClosed: int = 0
 // Faults, consumed in order: "<operation> <kind>". An operation is CREATE, PART<n>,
 // COMPLETE, ABORT, HEAD, GET or PUT. Kinds: a status, "drop" (the connection ends
 // with no response), "writefail" (the body can't be written), "cut" (the response
-// ends halfway), "errordoc", "nosuchupload", "badrange", "wrongetag".
+// ends halfway), "errordoc", "nosuchupload", "badrange", "wrongetag", "replaced"
+// (the object changes and the request gets its 412).
 var fakeFaults: array<string> = []
 var fakeCut: int = 1000
 var fakeHeadLength: int = -1
@@ -135,6 +136,10 @@ fun fakeHandle(request: HttpRequest): string {
     fakeLastRequest = request
     val fault = fakeTakeFault(operation)
     if (fault == "drop") return ""
+    if (fault == "replaced") {
+        fakeEtag = "\"object-2\""
+        return fakeError(412, "PreconditionFailed")
+    }
     if (fault == "nosuchupload") return fakeError(404, "NoSuchUpload")
     if (fault != "" && fault[0] >= 48 && fault[0] <= 57)
         return fakeError(s3ParseInt(fault, 500), "Injected")
@@ -675,9 +680,30 @@ fun testDownloads(client: S3Client): int {
     fakeFaults = ["GET wrongetag"]
     val wrongEtag = client.downloadStream("big/file.bin", sink, testOptions())
     if (wrongEtag.succeeded || wrongEtag.errorCode != "object_changed") return 310
+    // A 412 for an object that didn't change is the server's mistake: go on without
+    // the condition, even with no retries to spare, and don't refuse twice.
     fakeFaults = ["GET 412"]
+    fakeLog = []
+    out = byteBuffer()
+    val refused = client.downloadStream("big/file.bin", sink, S3TransferOptions(5242880, 0))
+    if (!refused.succeeded || out.size() != fakeObject.size) return 311
+    if (fakeLastRequest.header("If-Match") != "") return 317
+    failed = expectLog(318, "HEAD GET HEAD GET")
+    if (failed != 0) return failed
+    fakeFaults = ["GET 412", "GET 412"]
+    out = byteBuffer()
+    if (client.downloadStream("big/file.bin", sink, testOptions()).errorCode != "object_changed")
+        return 319
+    // Without the condition a changed object is still caught by its ETag.
+    fakeFaults = ["GET 412", "GET wrongetag"]
+    out = byteBuffer()
+    val unconditional = client.downloadStream("big/file.bin", sink, testOptions())
+    if (unconditional.errorCode != "object_changed" || out.size() != 0) return 320
+    // A 412 for an object that did change, or that can't be checked, ends it.
+    fakeFaults = ["GET replaced"]
     val changed = client.downloadStream("big/file.bin", sink, testOptions())
-    if (changed.succeeded || changed.errorCode != "object_changed") return 311
+    if (changed.succeeded || changed.errorCode != "object_changed") return 321
+    fakeEtag = "\"object-1\""
 
     // A refusing sink ends the transfer without further requests.
     fakeLog = []

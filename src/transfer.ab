@@ -341,7 +341,10 @@ private fun s3ContentRangeMatches(
 // Writes the bytes from `start` to the sink in order, reconnecting after a failure
 // and asking only for what hasn't arrived. Nothing is delivered twice, the retry
 // count restarts whenever bytes arrive, and If-Match stops a transfer that would
-// otherwise splice two versions of an object together.
+// otherwise splice two versions of an object together. SeaweedFS 3.97 refuses
+// If-Match with the ETag it gave, on an object of several chunks. So a refusal
+// ends the transfer only if the object did change; if not, requests go on without
+// the condition, and each response's own ETag is what gets compared.
 fun S3Client.streamRange(
     key: string,
     var sink: FnMut(string) -> bool,
@@ -358,9 +361,11 @@ fun S3Client.streamRange(
     var failures = 0
     var retries = 0
     var failure: S3TransferResult? = null
+    var conditional = etag != ""
     while (failure == null && offset < total) {
+        var refusedWrongly = false
         val extras = [S3Header("range", "bytes=$offset-${total - 1}")]
-        if (etag != "") extras.append(S3Header("if-match", etag))
+        if (conditional) extras.append(S3Header("if-match", etag))
         val signed = s3SignRequest(
             this.config, "GET", path, "", "", clock(), extras
         )
@@ -428,7 +433,13 @@ fun S3Client.streamRange(
                 lastError = code
                 val retryable = s3RetryableStatus(response.status) ||
                     code == "RequestTimeout"
-                if (!retryable) failure = s3TransferFailure(
+                if (response.status == 412 && conditional) {
+                    val current = this.statObject(key)
+                    refusedWrongly = current.succeeded && current.etag == etag &&
+                        current.contentLength == total
+                }
+                if (refusedWrongly) conditional = false
+                else if (!retryable) failure = s3TransferFailure(
                     if (response.status == 412) "object_changed" else code,
                     offset - start, 0, response.status, "",
                     response.header("x-amz-request-id"), retries
@@ -436,7 +447,7 @@ fun S3Client.streamRange(
             }
             close()
         }
-        if (failure == null && offset < total) {
+        if (failure == null && offset < total && !refusedWrongly) {
             failures = if (offset > attemptStart) 0 else failures + 1
             if (failures > maximumRetries) failure = s3TransferFailure(
                 lastError, offset - start, 0, lastStatus, "", "", retries
