@@ -41,7 +41,7 @@ weed server \
     -master.volumeSizeLimitMB=32 \
     -volume.port="$volume_port" \
     -volume.port.grpc="$((volume_port + 10000))" \
-    -volume.max=1 \
+    -volume.max=8 \
     -filer \
     -filer.port="$filer_port" \
     -filer.port.grpc="$((filer_port + 10000))" \
@@ -55,7 +55,8 @@ server_pid=$!
 
 ready=false
 for _ in $(seq 1 300); do
-    if curl --silent --max-time 1 "http://127.0.0.1:$s3_port/" >/dev/null; then
+    # Not curl: inside the Nix shell, Ubuntu's fails to load against Nix's libc.
+    if (exec 3<>"/dev/tcp/127.0.0.1/$s3_port") 2>/dev/null; then
         ready=true
         break
     fi
