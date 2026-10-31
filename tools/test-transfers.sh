@@ -258,6 +258,15 @@ check "continued download has the same sha256" same_sha "$work/later.bin" "$medi
 check "continuing removes the partial file" test ! -e "$work/later.bin.s3part"
 find "$work/later.bin" -delete
 
+# A sweep with a cutoff must not touch an upload that may still be running, even
+# when the server doesn't say when it started.
+running_id=$("$tool" start faults/running.bin 2>/dev/null)
+check "a sweep with a cutoff spares a running upload" equals \
+    "$("$tool" sweep faults/ 2000-01-01T00:00:00Z 2>/dev/null)" 0
+check "the running upload is still there" equals \
+    "$("$tool" incomplete faults/running.bin 2>/dev/null)" 1
+"$tool" abort faults/running.bin "$running_id" 2>/dev/null
+
 # A client killed outright can't abort; the sweep is how that gets cleaned up.
 "$tool" upload-file faults/killed.bin "$medium" 2>/dev/null &
 victim=$!

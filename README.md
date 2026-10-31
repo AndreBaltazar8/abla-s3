@@ -117,7 +117,10 @@ Any failure aborts the multipart upload. If the abort fails too, the result's
 A killed process can't abort anything, and neither can a create whose response
 was lost after S3 acted on it. `abortIncompleteUploads(prefix, initiatedBefore)`
 sweeps those up (`listMultipartUploads` shows them); on AWS, a bucket lifecycle
-rule with `AbortIncompleteMultipartUpload` does the same on a schedule.
+rule with `AbortIncompleteMultipartUpload` does the same on a schedule. A cutoff
+spares any upload whose start time the server doesn't report, and SeaweedFS 3.97
+reports none: there, a cutoff sweep aborts nothing, and a sweep without one aborts
+uploads that are still running.
 
 **Downloads** stream one response, and after a failure ask for only the bytes that
 haven't arrived. Every response must carry the exact expected `Content-Range` and
@@ -145,6 +148,10 @@ part, collect each response's `ETag`, and finish with `completeMultipartUpload`
 or `abortMultipartUpload`. Part sizes are then the uploader's to respect. URLs last
 at most seven days. Whoever holds one can use it, so treat it as a credential. A
 browser also needs the bucket's CORS rules to allow the request and expose `ETag`.
+
+SeaweedFS 3.97 ignores `response-content-disposition` on a presigned GET and
+completes an upload given a wrong part ETag; 4.48 does neither. Don't rely on either
+check against an old server.
 
 ## Results and diagnostics
 

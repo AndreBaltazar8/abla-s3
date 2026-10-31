@@ -470,7 +470,8 @@ fun S3Client.bucketRequest(query: string): S3Result {
 
 // Cleans up after a process that died mid-upload, which no client code can do
 // for itself. `initiatedBefore` (an ISO 8601 UTC time, compared as text) spares
-// uploads that may still be running; without it every match is aborted.
+// uploads that may still be running, and any whose start time the server doesn't
+// report; without it every match is aborted.
 fun S3Client.abortIncompleteUploads(
     prefix: string = "",
     initiatedBefore: string = ""
@@ -490,8 +491,9 @@ fun S3Client.abortIncompleteUploads(
             var index = 0
             while (index < page.uploads.size) {
                 val upload = page.uploads[index]
-                if (initiatedBefore == "" ||
-                    s3StringCompare(upload.initiated, initiatedBefore) < 0) {
+                // An upload of unknown age may still be running, so a cutoff spares it.
+                if (initiatedBefore == "" || (upload.initiated != "" &&
+                    s3StringCompare(upload.initiated, initiatedBefore) < 0)) {
                     val result = this.abortMultipartUpload(upload.key, upload.uploadId)
                     if (result.succeeded) aborted = aborted + 1
                     else {

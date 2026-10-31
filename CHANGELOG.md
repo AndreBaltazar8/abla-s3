@@ -9,6 +9,8 @@
   `abortIncompleteUploads` for what a killed process leaves behind.
 - Add presigned GET, PUT, and upload-part URLs.
 - Report `contentLength` in `S3Result`.
+- Spare uploads with no reported start time when `abortIncompleteUploads` has a
+  cutoff. They were always aborted, including running uploads on SeaweedFS.
 - Read provider error codes and messages with abla-xml, so escaped text is
   decoded. A body that isn't well-formed XML gives no provider fields, and the
   generic error code is reported instead.

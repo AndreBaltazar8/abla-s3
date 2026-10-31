@@ -15,6 +15,7 @@ var fakeEtag: string = "\"object-1\""
 var fakeParts: array<array<string>> = []
 var fakeUploadOpen: bool = false
 var fakeKeepBodies: bool = true
+var fakeListing: string = ""
 
 // What it saw.
 var fakeLog: array<string> = []
@@ -53,6 +54,7 @@ fun fakeError(status: int, code: string): string = fakeRespond(
 fun fakeOperation(request: HttpRequest): string {
     val partNumber = request.queryParameter("partNumber")
     if (partNumber != "") "PART$partNumber"
+    else if (request.method == "GET" && request.query.contains("uploads=")) "LIST"
     else if (request.method == "POST" && request.query == "uploads=") "CREATE"
     else if (request.method == "POST") "COMPLETE"
     else if (request.method == "DELETE") "ABORT"
@@ -136,6 +138,7 @@ fun fakeHandle(request: HttpRequest): string {
     if (fault == "nosuchupload") return fakeError(404, "NoSuchUpload")
     if (fault != "" && fault[0] >= 48 && fault[0] <= 57)
         return fakeError(s3ParseInt(fault, 500), "Injected")
+    if (operation == "LIST") return fakeRespond(200, "", fakeListing)
     if (operation == "CREATE") {
         fakeUploadOpen = true
         fakeParts = []
@@ -832,6 +835,30 @@ fun testLowLevel(client: S3Client): int {
     0
 }
 
+fun testSweep(client: S3Client): int {
+    fakeReset()
+    fakeListing = "<ListMultipartUploadsResult>" +
+        "<Upload><Key>a/old</Key><UploadId>1</UploadId><Initiated>2026-01-01T00:00:00Z</Initiated></Upload>" +
+        "<Upload><Key>a/new</Key><UploadId>2</UploadId><Initiated>2026-06-01T00:00:00Z</Initiated></Upload>" +
+        "<Upload><Key>a/unknown</Key><UploadId>3</UploadId></Upload>" +
+        "</ListMultipartUploadsResult>"
+    val listed = client.listMultipartUploads("a/")
+    if (!listed.succeeded || listed.uploads.size != 3 ||
+        listed.uploads[2].initiated != "") return 700
+    // A cutoff aborts only what is known to be older.
+    fakeLog = []
+    val cutoff = client.abortIncompleteUploads("a/", "2026-03-01T00:00:00Z")
+    if (!cutoff.succeeded || cutoff.aborted != 1) return 701
+    var failed = expectLog(702, "LIST ABORT")
+    if (failed != 0) return failed
+    if (fakeLastRequest.path != "/micro-test/a/old") return 703
+    // Without a cutoff, everything goes.
+    fakeLog = []
+    val everything = client.abortIncompleteUploads("a/")
+    if (!everything.succeeded || everything.aborted != 3) return 704
+    0
+}
+
 fun main: int {
     val directory = Path("/tmp/abla-s3-transfer-test-${linuxProcessId()}")
     directory.createDirectories()
@@ -842,6 +869,7 @@ fun main: int {
     if (failed == 0) failed = testFiles(client, directory)
     if (failed == 0) failed = testDownloads(client)
     if (failed == 0) failed = testLowLevel(client)
+    if (failed == 0) failed = testSweep(client)
     directory.removeTree()
     if (failed != 0) eprintln("transfer test failed: $failed")
     failed

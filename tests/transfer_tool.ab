@@ -154,7 +154,7 @@ fun main: int {
         }
         println("${listed.uploads.size}")
     } else if (command == "sweep") {
-        val sweep = client.abortIncompleteUploads(key)
+        val sweep = client.abortIncompleteUploads(key, processArgument(2))
         println("${sweep.aborted}")
         code = if (sweep.succeeded) 0 else 3
     } else if (command == "presign-get") {
