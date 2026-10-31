@@ -1,5 +1,4 @@
 import "abla/http"
-import "abla/http/tls"
 import "abla/process/time"
 import github("AndreBaltazar8/abla-xml")
 import "config.ab"
@@ -29,12 +28,41 @@ class S3Client(
 
 fun s3TransportLimit(maximumBodyBytes: int): int = maximumBodyBytes + 65536
 
+// What httpsClient does, over the wire: its connection sets no socket timeouts
+// and leaves SIGPIPE to end the process when the peer resets.
+private fun s3WireExchange(
+    config: S3Config,
+    request: string,
+    maximumResponseBytes: int
+): HttpTransportResult {
+    val wire = s3OpenWire(config)
+    if (!wire.connected) return HttpTransportResult("", false)
+    val write = wire.write
+    val read = wire.read
+    val close = wire.close
+    val succeeded = write(request)
+    var response = ""
+    var reading = succeeded
+    while (reading && response.size < maximumResponseBytes) {
+        val remaining = maximumResponseBytes - response.size
+        val chunk = read(if (remaining < 65536) remaining else 65536)
+        if (chunk.size > 0) response = "$response$chunk"
+        if (chunk.size == 0) reading = false
+        if (httpParseResponse(response).complete) reading = false
+    }
+    close()
+    HttpTransportResult(response, succeeded)
+}
+
 fun s3Client(config: S3Config): S3Client = S3Client(
     config,
     { request: HttpRequest, maximum: int, timeout: int ->
         if (config.useTls) {
-            httpsClient(
-                s3RequestHost(config), config.port,
+            httpClient(
+                s3Authority(config),
+                { bytes: string, limit: int, unused: int ->
+                    s3WireExchange(config, bytes, limit)
+                },
                 s3TransportLimit(maximum), s3TransportTimeout(timeout)
             ).send(request)
         } else if (config.host == "127.0.0.1") {

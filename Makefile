@@ -23,6 +23,7 @@ check:
 	$(COMPILER) build tests/config_test.ab -o $(BUILD_DIR)/config-test --no-cache
 	$(COMPILER) build tests/integration_test.ab -o $(BUILD_DIR)/integration-test --no-cache
 	$(COMPILER) build tests/transfer_test.ab -o $(BUILD_DIR)/transfer-test --no-cache
+	$(COMPILER) build tests/tls_fault_test.ab -o $(BUILD_DIR)/tls-fault-test --no-cache
 	$(COMPILER) build tests/transfer_tool.ab -o $(BUILD_DIR)/transfer-tool --no-cache
 
 test:
@@ -36,6 +37,7 @@ test-in-shell: check
 	$(BUILD_DIR)/signing-test
 	$(BUILD_DIR)/client-test
 	$(BUILD_DIR)/transfer-test
+	bash tools/test-tls-faults.sh $(BUILD_DIR)/tls-fault-test
 	S3_ENDPOINT_HOST=127.0.0.1 S3_ENDPOINT_PORT=19001 \
 		S3_BUCKET=micro-config S3_REGION=eu-west-1 \
 		S3_ACCESS_KEY_ID_FILE=$(PROJECT_DIR)/tests/access_key_fixture.txt \

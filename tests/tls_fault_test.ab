@@ -1,0 +1,92 @@
+// The whole-object operations against a real TLS peer that misbehaves. The peer is
+// a forked child, and the object's key picks what it does. Without the protection
+// this is about, the process dies of SIGPIPE on a reset or hangs on a stall, so
+// tools/test-tls-faults.sh runs it under a time limit.
+import "../src/s3.ab"
+import "abla/io"
+import "abla/process"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/tls/hosted"
+import "abla/unsafe/memory"
+
+// An unread close with a zero linger sends RST rather than FIN.
+trusted fun peerReset(var connection: TlsConnection): void {
+    val descriptor = tlsControlInt(connection.handle, 16)
+    val linger = nativeByteBuffer(8)
+    // l_onoff 1, l_linger 0.
+    linger.storeI64(0, 1)
+    linuxSyscall5(54, descriptor, 1, 13, nativePointerAddress(linger.address), 8)
+    linger.close()
+    linuxTcpCloseDescriptor(descriptor)
+    connection.handle = -1
+    return
+}
+
+fun peerServe(var listener: TlsListener): void {
+    var flaky = 0
+    val held: array<int> = []
+    while (true) {
+        var connection = listener.accept()
+        val request = connection.read(65536)
+        if (request.contains("/stall ")) {
+            held.append(connection.handle)
+            connection.handle = -1
+        } else if (request.contains("/reset") ||
+            (request.contains("/flaky ") && flaky == 0)) {
+            if (request.contains("/flaky ")) flaky = 1
+            peerReset(connection)
+        } else {
+            connection.write("HTTP/1.1 200 OK\r\nETag: \"tls\"\r\nContent-Length: 4\r\n\r\nbody")
+            connection.close()
+        }
+    }
+    return
+}
+
+fun faultConfig(port: int, retries: int): S3Config = S3Config(
+    "localhost", port, "bucket", "us-east-1", "test-access-key", "test-secret-key", "",
+    true, true, 300, 1048576, retries
+)
+
+fun runFaults(port: int): int {
+    val client = s3Client(faultConfig(port, 0))
+    val fine = client.getObject("fine")
+    if (!fine.succeeded || fine.body != "body" || fine.etag != "\"tls\"") {
+        eprintln("plain request: ${fine.errorCode} status=${fine.status}")
+        return 1
+    }
+    // A reset while waiting for the response, then while sending a large body.
+    if (client.getObject("reset").succeeded) return 2
+    if (client.putObject("reset-put", "x".repeat(33554432)).succeeded) return 3
+    // The process is still here to do another request.
+    if (!client.getObject("fine").succeeded) return 4
+    // A peer that goes quiet costs one timeout.
+    val started = monotonicMilliseconds()
+    val stalled = client.getObject("stall")
+    val elapsed = monotonicMilliseconds() - started
+    if (stalled.succeeded) return 5
+    if (elapsed < 250 || elapsed > 5000) { eprintln("stall took $elapsed ms"); return 6 }
+    // A reset is retried like any other network failure.
+    val retried = s3Client(faultConfig(port, 2)).getObject("flaky")
+    if (!retried.succeeded || retried.retries != 1) return 7
+    0
+}
+
+fun main: int {
+    var listener = tlsListen(processArgument(0), processArgument(1), "::", 0)
+    val port = listener.localPort()
+    if (port <= 0) { eprintln("no listener"); return 10 }
+    val child = linuxSyscall0(57)
+    if (child == 0) {
+        // PR_SET_PDEATHSIG: a client that dies must not leave the peer behind.
+        linuxSyscall2(157, 1, 9)
+        peerServe(listener)
+        return 0
+    }
+    if (child < 0) { eprintln("fork failed"); return 11 }
+    val failed = runFaults(port)
+    linuxSyscall2(62, child, 9)
+    if (failed != 0) eprintln("TLS fault test failed: $failed")
+    failed
+}

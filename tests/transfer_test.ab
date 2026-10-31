@@ -699,7 +699,8 @@ fun testDownloads(client: S3Client): int {
 }
 
 fun testPresigning(client: S3Client): int {
-    // AWS's published query-string example for GET /test.txt.
+    // AWS's published query-string example for GET /test.txt. botocore 1.40.18's
+    // S3SigV4QueryAuth gives this same URL, byte for byte, for these inputs.
     val aws = S3Config(
         "s3.amazonaws.com", 443, "examplebucket", "us-east-1",
         "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",

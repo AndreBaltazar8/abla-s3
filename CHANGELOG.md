@@ -12,6 +12,8 @@
 - Read provider error codes and messages with abla-xml, so escaped text is
   decoded. A body that isn't well-formed XML gives no provider fields, and the
   generic error code is reported instead.
+- Whole-object requests over TLS set socket timeouts and survive a peer that
+  resets: they could hang, or end the process with SIGPIPE.
 
 ## 0.1.0
 
