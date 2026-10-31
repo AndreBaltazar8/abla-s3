@@ -311,7 +311,16 @@ echo "== TLS, with certificate verification"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost \
     -keyout "$work/tls.key" -out "$work/tls.crt" 2>/dev/null
-weed s3 -filer="127.0.0.1:$filer_port" -ip.bind=127.0.0.1 \
+# Newer versions also start catalog listeners on fixed ports, which the server
+# above already holds. Older versions don't know these flags.
+gateway_flags=()
+gateway_help=$(weed s3 -h 2>&1)
+for flag in port.iceberg port.lance; do
+    if [[ $gateway_help == *"-$flag "* ]]; then
+        gateway_flags+=("-$flag=0")
+    fi
+done
+weed s3 "${gateway_flags[@]}" -filer="127.0.0.1:$filer_port" -ip.bind=127.0.0.1 \
     -port="$((tls_port + 1))" -port.https="$tls_port" \
     -port.grpc="$((tls_port + 10000))" \
     -cert.file="$work/tls.crt" -key.file="$work/tls.key" \
