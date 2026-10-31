@@ -1,0 +1,12 @@
+version = 2
+
+[[package]]
+name = "abla-xml"
+provider = "git"
+identity = "github:AndreBaltazar8/abla-xml"
+source = "https://github.com/AndreBaltazar8/abla-xml.git"
+selector-kind = "head"
+selector = "HEAD"
+revision = "49f7891ef58ba37cf24e35614d2ba631ae7a538b"
+digest = "8472761708b552be711e57ceffb44d0aedb7b56b"
+entry = "src/xml.ab"

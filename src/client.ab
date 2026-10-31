@@ -1,7 +1,7 @@
 import "abla/http"
 import "abla/http/tls"
 import "abla/process/time"
-import "abla/text"
+import github("AndreBaltazar8/abla-xml")
 import "config.ab"
 import "signing.ab"
 
@@ -59,19 +59,6 @@ fun s3ClientWithTransport(
     clock: () -> string,
     wait: (int) -> void
 ): S3Client = S3Client(config, transport, clock, wait)
-
-fun s3XmlTag(body: string, name: string): string {
-    val opening = "<$name>"
-    val closing = "</$name>"
-    val begin = textFindSequence(body, opening, 0, body.size)
-    var result = ""
-    if (begin >= 0) {
-        val contentBegin = begin + opening.size
-        val end = textFindSequence(body, closing, contentBegin, body.size)
-        if (end >= contentBegin) result = body.slice(contentBegin, end)
-    }
-    result
-}
 
 fun s3RetryableStatus(status: int): bool =
     status == 408 || status == 425 || status == 429 || status == 500 ||
@@ -131,8 +118,11 @@ fun S3Client.rawRequest(
         var errorCode = ""
         var errorMessage = ""
         if (!success) {
-            errorCode = s3XmlTag(exchanged.response.body, "Code")
-            errorMessage = s3XmlTag(exchanged.response.body, "Message")
+            val document = xmlParse(exchanged.response.body).document
+            if (document != null) {
+                errorCode = document.root.childText("Code")
+                errorMessage = document.root.childText("Message")
+            }
             if (errorCode == "") errorCode = if (!bounded) "response_too_large"
                 else if (!complete) "incomplete_response"
                 else if (!exchanged.succeeded) "transport_failed"

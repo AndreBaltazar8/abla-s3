@@ -11,13 +11,13 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     env:
-      ABLAC_COMMIT: a5010ece743943f8fe6462de3437ef286cb99685
+      ABLAC_COMMIT: b14ba163fe8b073049085611cba85244a9b101f1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
       - uses: AndreBaltazar8/setup-abla@b21e1290aa49862e7bf187dc84b6b3511f4b571e # v1.0.0
         with:
-          version: '0.2.10'
+          version: '0.2.25'
       - name: Check out the matching Abla development shell
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/AndreBaltazar8/ablac "$RUNNER_TEMP/ablac"

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Read provider error codes and messages with abla-xml, so escaped text is
+  decoded. A body that isn't well-formed XML gives no provider fields, and the
+  generic error code is reported instead.
+
 ## 0.1.0
 
 - Add strict S3-compatible endpoint, credential, and object-key configuration.

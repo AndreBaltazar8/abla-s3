@@ -12,6 +12,7 @@ NIXPKGS_IMPORT := -I nixpkgs=$(NIXPKGS_SOURCE)
 
 check:
 	mkdir -p $(BUILD_DIR)
+	$(COMPILER) package vendor --project $(PROJECT_DIR)
 	$(COMPILER) build tests/signing_test.ab -o $(BUILD_DIR)/signing-test --no-cache
 	$(COMPILER) build tests/client_test.ab -o $(BUILD_DIR)/client-test --no-cache
 	$(COMPILER) build tests/config_test.ab -o $(BUILD_DIR)/config-test --no-cache

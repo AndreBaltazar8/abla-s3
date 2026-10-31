@@ -5,6 +5,7 @@ var s3ClientTestAttempts: int = 0
 var s3ClientTestAuthorization: string = ""
 var s3ClientTestPath: string = ""
 var s3ClientTestBody: string = ""
+var s3ClientTestErrorBody: string = ""
 
 fun s3ClientTestTransport(
     request: HttpRequest,
@@ -24,6 +25,9 @@ fun s3ClientTestTransport(
             HttpHeader("x-amz-request-id", "request-404")
         ], "<Error><Code>NoSuchKey</Code><Message>Missing</Message></Error>"),
         true, true)
+    if (s3ClientTestMode == 3)
+        return HttpClientResult(HttpResponse(403, [], s3ClientTestErrorBody),
+            true, true)
     HttpClientResult(HttpResponse(200, [
         HttpHeader("ETag", "\"etag-1\""),
         HttpHeader("x-amz-version-id", "version-1"),
@@ -81,5 +85,34 @@ fun main: int {
         5000, 1048576, 0
     )
     if (insecure.valid()) return 8
+
+    s3ClientTestMode = 3
+    s3ClientTestErrorBody = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+        "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" +
+        "<Code>Access&amp;Denied</Code>" +
+        "<Message>Key &lt;a&gt; isn&apos;t &#x41;llowed</Message></Error>"
+    val escaped = client.getObject("products/escaped.zip")
+    if (escaped.errorCode != "Access&Denied" ||
+        escaped.errorMessage != "Key <a> isn't Allowed") return 10
+
+    // Only the direct children of the root are the provider's fields.
+    s3ClientTestErrorBody = "<Error><Detail><Code>Nested</Code></Detail></Error>"
+    val nested = client.getObject("products/nested.zip")
+    if (nested.errorCode != "s3_error" || nested.errorMessage != "s3_error") return 11
+
+    s3ClientTestErrorBody = "Forbidden by the gateway"
+    val plain = client.getObject("products/plain.zip")
+    if (plain.succeeded || plain.status != 403 ||
+        plain.errorCode != "s3_error" || plain.errorMessage != "s3_error") return 12
+
+    s3ClientTestErrorBody = ""
+    val empty = client.getObject("products/empty.zip")
+    if (empty.errorCode != "s3_error" || empty.errorMessage != "s3_error") return 13
+
+    // Tags that look right but aren't a document are not trusted.
+    s3ClientTestErrorBody = "<Error><Code>Cut</Code><Message>Off"
+    val truncated = client.getObject("products/truncated.zip")
+    if (truncated.errorCode != "s3_error" ||
+        truncated.errorMessage != "s3_error") return 14
     0
 }
