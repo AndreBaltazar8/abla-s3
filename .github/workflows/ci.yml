@@ -15,7 +15,7 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
       - uses: AndreBaltazar8/setup-abla@b21e1290aa49862e7bf187dc84b6b3511f4b571e # v1.0.0
         with:
-          version: '0.2.25'
+          version: '0.2.27'
       - name: Run unit and configuration tests
         run: make test-in-shell COMPILER=ablac
       - name: Run real SeaweedFS compatibility tests
