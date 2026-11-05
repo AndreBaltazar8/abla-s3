@@ -20,6 +20,7 @@ check:
 	$(COMPILER) package vendor --project $(PROJECT_DIR)
 	$(COMPILER) build tests/signing_test.ab -o $(BUILD_DIR)/signing-test --no-cache
 	$(COMPILER) build tests/client_test.ab -o $(BUILD_DIR)/client-test --no-cache
+	$(COMPILER) build tests/bucket_test.ab -o $(BUILD_DIR)/bucket-test --no-cache
 	$(COMPILER) build tests/config_test.ab -o $(BUILD_DIR)/config-test --no-cache
 	$(COMPILER) build tests/integration_test.ab -o $(BUILD_DIR)/integration-test --no-cache
 	$(COMPILER) build tests/transfer_test.ab -o $(BUILD_DIR)/transfer-test --no-cache
@@ -36,6 +37,7 @@ test:
 test-in-shell: check
 	$(BUILD_DIR)/signing-test
 	$(BUILD_DIR)/client-test
+	$(BUILD_DIR)/bucket-test
 	$(BUILD_DIR)/transfer-test
 	bash tools/test-tls-faults.sh $(BUILD_DIR)/tls-fault-test
 	S3_ENDPOINT_HOST=127.0.0.1 S3_ENDPOINT_PORT=19001 \

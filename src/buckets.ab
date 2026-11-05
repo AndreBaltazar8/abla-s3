@@ -1,0 +1,232 @@
+import "abla/bytes"
+import github("AndreBaltazar8/abla-xml")
+import "client.ab"
+import "multipart.ab"
+
+class S3Object(
+    val key: string,
+    val size: int,
+    val etag: string,
+    val lastModified: string,
+    val storageClass: string
+)
+
+class S3ObjectList(
+    val succeeded: bool,
+    val objects: array<S3Object>,
+    val commonPrefixes: array<string>,
+    val truncated: bool,
+    val nextContinuationToken: string,
+    val result: S3Result
+)
+
+// No connection is held between pages. The next token resumes after the last
+// successful page, including when the page-fetch bound ends the traversal.
+class S3ObjectPages(
+    val client: S3Client,
+    val prefix: string,
+    val delimiter: string,
+    val maxKeys: int,
+    val maximumPages: int,
+    var continuationToken: string,
+    var pages: int = 0,
+    var finished: bool = false,
+    var result: S3Result = s3InvalidResult("not_started")
+)
+
+private fun s3BucketFailure(result: S3Result, code: string, message: string = ""): S3Result =
+    S3Result(false, result.status, result.body, result.etag, result.versionId,
+        result.requestId, code, if (message != "") message else code,
+        result.retries, result.contentLength, result.bucketRegion)
+
+private fun s3ObjectListFailure(result: S3Result): S3ObjectList =
+    S3ObjectList(false, [], [], false, "", result)
+
+// Missing optional fields are empty; duplicate or non-text fields are invalid.
+// Only direct children in the root's namespace are protocol fields.
+private fun s3BucketText(root: XmlElement, name: string, optional: bool = false): string? {
+    val found = root.elements(name, root.namespaceUri)
+    if (found.size == 0 && optional) return ""
+    if (found.size != 1 || found[0].elements().size != 0) return null
+    found[0].text()
+}
+
+private fun s3BucketNumber(value: string?): int {
+    if (value == null || value == "") return -1
+    var number = 0
+    var at = 0
+    while (at < value.size) {
+        val digit = value[at] - 48
+        if (digit < 0 || digit > 9 || number > 922337203685477580 ||
+            (number == 922337203685477580 && digit > 7)) return -1
+        number = number * 10 + digit
+        at = at + 1
+    }
+    number
+}
+
+private fun s3BucketHex(byte: int): int =
+    if (byte >= 48 && byte <= 57) byte - 48
+    else if (byte >= 65 && byte <= 70) byte - 55
+    else if (byte >= 97 && byte <= 102) byte - 87
+    else -1
+
+// URI decoding, not form decoding: a literal '+' stays '+'. Never use this
+// for the opaque continuation token, even with EncodingType=url.
+private fun s3BucketDecode(value: string, encoded: bool): string? {
+    if (!encoded) return value
+    val output = byteBuffer()
+    var at = 0
+    while (at < value.size) {
+        var byte = value[at]
+        if (byte == 37) {
+            if (at + 2 >= value.size) return null
+            val high = s3BucketHex(value[at + 1])
+            val low = s3BucketHex(value[at + 2])
+            if (high < 0 || low < 0) return null
+            byte = high * 16 + low
+            at = at + 2
+        }
+        output.appendByteValue(byte)
+        at = at + 1
+    }
+    val decoded = output.toText()
+    if (decoded.isValidUtf8()) decoded else null
+}
+
+// One bounded ListObjectsV2 response; no object data is downloaded.
+fun S3Client.listObjects(
+    prefix: string = "",
+    delimiter: string = "",
+    maxKeys: int = 1000,
+    continuationToken: string = ""
+): S3ObjectList {
+    if (!this.config.valid())
+        return s3ObjectListFailure(s3InvalidResult("invalid_configuration"))
+    if (maxKeys < 1 || maxKeys > 1000 || !prefix.isValidUtf8() ||
+        !delimiter.isValidUtf8() || !continuationToken.isValidUtf8())
+        return s3ObjectListFailure(s3InvalidResult("invalid_listing_parameters"))
+    val names = ["list-type", "encoding-type", "max-keys"]
+    val values = ["2", "url", "$maxKeys"]
+    if (prefix != "") { names.append("prefix"); values.append(prefix) }
+    if (delimiter != "") { names.append("delimiter"); values.append(delimiter) }
+    if (continuationToken != "") {
+        names.append("continuation-token")
+        values.append(continuationToken)
+    }
+    val result = this.controlRequest("GET", "", s3CanonicalQuery(names, values))
+    if (!result.succeeded) return s3ObjectListFailure(result)
+    val invalid = s3BucketFailure(result, "invalid_response")
+    // Slow S3-compatible servers can send keep-alive whitespace before XML.
+    val parsed = xmlParse(result.body.trim()).document
+    if (parsed == null) return s3ObjectListFailure(invalid)
+    val root = parsed.root
+    if (root.namespaceUri != "" &&
+        root.namespaceUri != "http://s3.amazonaws.com/doc/2006-03-01/")
+        return s3ObjectListFailure(invalid)
+    if (root.localName == "Error") {
+        val code = s3BucketText(root, "Code")
+        val message = s3BucketText(root, "Message", true)
+        if (code == null || code == "" || message == null)
+            return s3ObjectListFailure(invalid)
+        return s3ObjectListFailure(s3BucketFailure(result, code, message))
+    }
+    if (root.localName != "ListBucketResult") return s3ObjectListFailure(invalid)
+    val truncated = s3BucketText(root, "IsTruncated")
+    val encoding = s3BucketText(root, "EncodingType", true)
+    val nextToken = s3BucketText(root, "NextContinuationToken", true)
+    val keyCount = s3BucketText(root, "KeyCount", true)
+    val maximum = s3BucketText(root, "MaxKeys", true)
+    if ((truncated != "true" && truncated != "false") ||
+        (encoding != "" && encoding != "url") || nextToken == null ||
+        keyCount == null || maximum == null) return s3ObjectListFailure(invalid)
+    if (truncated == "true" &&
+        (nextToken == "" || nextToken == continuationToken))
+        return s3ObjectListFailure(invalid)
+    if ((keyCount != "" && (s3BucketNumber(keyCount) < 0 ||
+        s3BucketNumber(keyCount) > maxKeys)) ||
+        (maximum != "" && (s3BucketNumber(maximum) < 0 ||
+        s3BucketNumber(maximum) > maxKeys))) return s3ObjectListFailure(invalid)
+    val objects: array<S3Object> = []
+    for (entry in root.elements("Contents", root.namespaceUri)) {
+        val keyText = s3BucketText(entry, "Key")
+        val size = s3BucketNumber(s3BucketText(entry, "Size"))
+        val etag = s3BucketText(entry, "ETag", true)
+        val modified = s3BucketText(entry, "LastModified", true)
+        val storage = s3BucketText(entry, "StorageClass", true)
+        if (keyText == null || keyText == "" || size < 0 || etag == null ||
+            modified == null || storage == null) return s3ObjectListFailure(invalid)
+        val key = s3BucketDecode(keyText, encoding == "url")
+        if (key == null) return s3ObjectListFailure(invalid)
+        objects.append(S3Object(key, size, etag, modified, storage))
+        if (objects.size > maxKeys) return s3ObjectListFailure(invalid)
+    }
+    val prefixes: array<string> = []
+    for (entry in root.elements("CommonPrefixes", root.namespaceUri)) {
+        val text = s3BucketText(entry, "Prefix")
+        if (text == null || text == "") return s3ObjectListFailure(invalid)
+        val decoded = s3BucketDecode(text, encoding == "url")
+        if (decoded == null) return s3ObjectListFailure(invalid)
+        prefixes.append(decoded)
+        if (objects.size + prefixes.size > maxKeys)
+            return s3ObjectListFailure(invalid)
+    }
+    val returned = objects.size + prefixes.size
+    if ((keyCount != "" && s3BucketNumber(keyCount) != returned) ||
+        (maximum != "" && returned > s3BucketNumber(maximum)))
+        return s3ObjectListFailure(invalid)
+    S3ObjectList(true, objects, prefixes, truncated == "true",
+        if (truncated == "true") nextToken else "", result)
+}
+
+fun S3Client.objectPages(
+    prefix: string = "",
+    delimiter: string = "",
+    maxKeys: int = 1000,
+    maximumPages: int = 1000,
+    continuationToken: string = ""
+): S3ObjectPages = S3ObjectPages(this, prefix, delimiter, maxKeys,
+    maximumPages, continuationToken)
+
+// A failure is returned once as a failed page, then iteration ends. Reaching
+// the page-fetch bound while more pages remain is a failure, not clean EOF.
+fun S3ObjectPages.next(): S3ObjectList? {
+    if (this.finished) return null
+    if (this.maximumPages <= 0 || this.pages >= this.maximumPages) {
+        this.finished = true
+        this.result = s3InvalidResult(if (this.maximumPages <= 0)
+            "invalid_pagination_limit" else "pagination_limit")
+        return S3ObjectList(false, [], [], true, this.continuationToken, this.result)
+    }
+    val page = this.client.listObjects(this.prefix, this.delimiter,
+        this.maxKeys, this.continuationToken)
+    this.pages = this.pages + 1
+    this.result = page.result
+    if (!page.succeeded || !page.truncated) this.finished = true
+    if (page.succeeded) this.continuationToken = page.nextContinuationToken
+    page
+}
+
+fun S3Client.headBucket(): S3Result = this.controlRequest("HEAD", "", "")
+
+// The constraint selects the new bucket's location, not a new signing region
+// or endpoint. An empty argument follows the client's configured region.
+fun S3Client.createBucket(locationConstraint: string = ""): S3Result {
+    if (!this.config.valid()) return s3InvalidResult("invalid_configuration")
+    val location = if (locationConstraint == "") this.config.regionName
+        else locationConstraint
+    var valid = location.size > 0 && location.size <= 64
+    var at = 0
+    while (valid && at < location.size) {
+        val byte = location[at]
+        valid = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) ||
+            (byte >= 48 && byte <= 57) || byte == 45
+        at = at + 1
+    }
+    if (!valid) return s3InvalidResult("invalid_location_constraint")
+    if (location == "us-east-1" || location == "auto")
+        return this.controlRequest("PUT", "", "")
+    val body = "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" +
+        "<LocationConstraint>$location</LocationConstraint></CreateBucketConfiguration>"
+    this.controlRequest("PUT", "", "", body, [S3Header("content-type", "application/xml")])
+}

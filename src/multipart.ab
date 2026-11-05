@@ -174,7 +174,8 @@ fun S3Client.sendOnce(
         response.header("x-amz-version-id"),
         response.header("x-amz-request-id"),
         errorCode, errorMessage, 0,
-        s3ContentLength(response.header("Content-Length"))
+        s3ContentLength(response.header("Content-Length")),
+        response.header("x-amz-bucket-region")
     )
 }
 
@@ -250,7 +251,7 @@ fun S3Client.controlRequest(
     S3Result(
         result.succeeded, result.status, result.body, result.etag,
         result.versionId, result.requestId, result.errorCode,
-        result.errorMessage, retries, result.contentLength
+        result.errorMessage, retries, result.contentLength, result.bucketRegion
     )
 }
 
@@ -317,7 +318,7 @@ fun S3Client.sendPart(
     S3Result(
         result.succeeded, result.status, result.body, result.etag,
         result.versionId, result.requestId, result.errorCode,
-        result.errorMessage, retries, result.contentLength
+        result.errorMessage, retries, result.contentLength, result.bucketRegion
     )
 }
 

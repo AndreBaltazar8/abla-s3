@@ -4,5 +4,6 @@ import "wire.ab"
 import "client.ab"
 import "multipart.ab"
 import "transfer.ab"
+import "buckets.ab"
 
 fun s3PackageVersion(): string = "0.1.0"

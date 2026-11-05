@@ -15,7 +15,8 @@ class S3Result(
     val errorCode: string,
     val errorMessage: string,
     val retries: int,
-    val contentLength: int = -1
+    val contentLength: int = -1,
+    val bucketRegion: string = ""
 )
 
 class S3Client(
@@ -173,7 +174,8 @@ fun S3Client.rawRequest(
             exchanged.response.header("x-amz-version-id"),
             exchanged.response.header("x-amz-request-id"),
             errorCode, errorMessage, retries,
-            s3ContentLength(exchanged.response.header("Content-Length"))
+            s3ContentLength(exchanged.response.header("Content-Length")),
+            exchanged.response.header("x-amz-bucket-region")
         )
         if (!success && retryable && retries < this.config.maximumNetworkRetries) {
             wait(s3RetryDelay(retries))

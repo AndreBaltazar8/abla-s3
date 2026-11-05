@@ -1,0 +1,282 @@
+// A local in-memory S3 peer: the real signer/request serializer/reader run,
+// but the wire exchanges only these recorded or synthetic responses.
+import "../src/s3.ab"
+import "abla/io"
+import "abla/process"
+
+var bucketResponses: array<string> = []
+var bucketRequests: array<HttpRequest> = []
+var bucketResponseIndex = 0
+var bucketOutput = ""
+var bucketReadAt = 0
+var bucketWritten = ""
+var bucketStarted = false
+var bucketClosed = 0
+var bucketWaits = 0
+var bucketClockCalls = 0
+var bucketChecks = 0
+
+fun bucketReset(responses: array<string>): void {
+    bucketResponses = responses
+    bucketRequests = []
+    bucketResponseIndex = 0
+    bucketClosed = 0
+    bucketWaits = 0
+    bucketClockCalls = 0
+}
+
+fun bucketConnect(): S3Wire {
+    bucketWritten = ""
+    bucketOutput = ""
+    bucketReadAt = 0
+    bucketStarted = false
+    S3Wire(true, { bytes: string ->
+        bucketWritten = "$bucketWritten$bytes"
+        true
+    }, { maximum: int ->
+        if (!bucketStarted) {
+            bucketStarted = true
+            bucketRequests.append(httpParseRequest(bucketWritten))
+            if (bucketResponseIndex < bucketResponses.size)
+                bucketOutput = bucketResponses[bucketResponseIndex]
+            bucketResponseIndex = bucketResponseIndex + 1
+        }
+        val end = if (bucketReadAt + maximum < bucketOutput.size)
+            bucketReadAt + maximum else bucketOutput.size
+        val bytes = bucketOutput.slice(bucketReadAt, end)
+        bucketReadAt = end
+        bytes
+    }, { -> bucketClosed = bucketClosed + 1 })
+}
+
+fun bucketClock(): string {
+    val date = "20260818T00000${bucketClockCalls}Z"
+    bucketClockCalls = bucketClockCalls + 1
+    date
+}
+fun bucketWait(milliseconds: int): void { bucketWaits = bucketWaits + 1 }
+fun bucketClient(pathStyle: bool = true, region: string = "us-east-1"): S3Client =
+    s3ClientWithWire(S3Config("127.0.0.1", 19000, "bucket-test", region,
+        "test-access-key", "test-secret-key", "", pathStyle, false,
+        5000, 4096, 1), bucketConnect, bucketClock, bucketWait)
+
+fun bucketExpect(ok: bool, label: string): void {
+    bucketChecks = bucketChecks + 1
+    if (!ok) { eprintln("bucket test failed: $label"); exit(1) }
+}
+
+fun bucketResponse(body: string, status: int = 200, headers: string = ""): string =
+    "HTTP/1.1 $status X\r\nx-amz-request-id: bucket-request\r\n" +
+    "${headers}Content-Length: ${body.size}\r\n\r\n$body"
+fun bucketObject(key: string, size: string = "5"): string =
+    "<Contents><Key>$key</Key><Size>$size</Size><ETag>&quot;e&quot;</ETag>" +
+    "<LastModified>2026-11-05T00:00:00.000Z</LastModified>" +
+    "<StorageClass>STANDARD</StorageClass></Contents>"
+fun bucketPage(contents: string = "", prefixes: string = "", truncated: bool = false,
+    token: string = "", encoding: string = "url", statistics: string = ""): string =
+    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" +
+    "<IsTruncated>${if (truncated) "true" else "false"}</IsTruncated>" +
+    "${if (encoding == "") "" else "<EncodingType>$encoding</EncodingType>"}" +
+    "${if (token == "") "" else "<NextContinuationToken>$token</NextContinuationToken>"}" +
+    "$contents$prefixes$statistics</ListBucketResult>"
+
+fun testBucketListing(): void {
+    val client = bucketClient()
+    bucketReset([bucketResponse("<ListBucketResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>" +
+        "<Name>bucket-test</Name><Prefix/><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>" +
+        "<IsTruncated>false</IsTruncated></ListBucketResult>")])
+    val empty = client.listObjects()
+    bucketExpect(empty.succeeded && empty.objects.size == 0 &&
+        empty.commonPrefixes.size == 0 && !empty.truncated, "empty bucket")
+    bucketExpect(bucketRequests.size == 1 && bucketClosed == 1, "one closed request")
+    val request = bucketRequests[0]
+    bucketExpect(request.method == "GET" && request.path == "/bucket-test" &&
+        request.query == "encoding-type=url&list-type=2&max-keys=1000", "signed bucket query")
+    bucketExpect(request.header("Authorization").contains("/us-east-1/s3/aws4_request") &&
+        request.header("x-amz-content-sha256") == s3PayloadHash(""), "signed GET")
+
+    val contents = bucketObject("caf%C3%A9%2Fplus%2Bspace%20%252F", "9223372036854775807") +
+        bucketObject("literal+plus", "0") + bucketObject("a%26b&amp;c")
+    bucketReset([bucketResponse(bucketPage(contents,
+        "<CommonPrefixes><Prefix>dir%2f</Prefix></CommonPrefixes>", false, "", "url",
+        "<KeyCount>4</KeyCount><MaxKeys>7</MaxKeys>"))])
+    val listed = client.listObjects("a &/+", "/", 7, "t+/=%")
+    bucketExpect(listed.succeeded && listed.objects.size == 3 &&
+        listed.commonPrefixes.size == 1, "objects and common prefixes")
+    bucketExpect(listed.objects[0].key == "café/plus+space %2F" &&
+        listed.objects[0].size == 9223372036854775807, "UTF8 and exactly one decoding pass")
+    bucketExpect(listed.objects[1].key == "literal+plus" && listed.objects[1].size == 0 &&
+        listed.objects[2].key == "a&b&c" && listed.commonPrefixes[0] == "dir/", "URI not form decoding")
+    bucketExpect(listed.objects[0].etag == "\"e\"" &&
+        listed.objects[0].storageClass == "STANDARD" &&
+        listed.objects[0].lastModified == "2026-11-05T00:00:00.000Z", "metadata")
+    bucketExpect(bucketRequests[0].query ==
+        "continuation-token=t%2B%2F%3D%25&delimiter=%2F&encoding-type=url&list-type=2&max-keys=7&prefix=a%20%26%2F%2B",
+        "canonical encoded parameters")
+
+    bucketReset([bucketResponse(bucketPage(bucketObject("%2F+&amp;"), "", false, "", ""))])
+    val raw = client.listObjects()
+    bucketExpect(raw.succeeded && raw.objects[0].key == "%2F+&", "unencoded keys stay unencoded")
+    bucketReset([bucketResponse(bucketPage(bucketObject("control%00byte")))])
+    val control = client.listObjects()
+    bucketExpect(control.succeeded && control.objects[0].key == "control${byteEncode(0)}byte",
+        "XML-inexpressible key byte is preserved")
+    bucketReset([bucketResponse(bucketPage())])
+    bucketExpect(bucketClient(false).listObjects().succeeded && bucketRequests[0].path == "/" &&
+        bucketRequests[0].header("Host") == "bucket-test.127.0.0.1:19000", "virtual host listing")
+}
+
+fun testBucketPaging(): void {
+    val client = bucketClient()
+    bucketReset([bucketResponse(bucketPage("", "", true, "next+/=%2F")),
+        bucketResponse(bucketPage(bucketObject("done")))])
+    var pages = client.objectPages(maximumPages = 2)
+    val first = pages.next()
+    if (first == null) { bucketExpect(false, "first page missing"); return }
+    bucketExpect(first.succeeded && first.truncated && first.objects.size == 0, "empty truncated page advances")
+    val second = pages.next()
+    if (second == null) { bucketExpect(false, "second page missing"); return }
+    bucketExpect(second.succeeded && !second.truncated && second.objects[0].key == "done", "second page")
+    bucketExpect(pages.next() == null && pages.finished && pages.pages == 2 &&
+        bucketRequests.size == 2, "clean exhaustion")
+    bucketExpect(bucketRequests[1].query.contains("continuation-token=next%2B%2F%3D%252F"), "token stays opaque")
+
+    bucketReset([bucketResponse(bucketPage("", "", true, "resume"))])
+    var bounded = client.objectPages(maximumPages = 1)
+    bounded.next()
+    val limited = bounded.next()
+    if (limited == null) { bucketExpect(false, "bound silently truncated"); return }
+    bucketExpect(!limited.succeeded && limited.result.errorCode == "pagination_limit" &&
+        limited.truncated && limited.nextContinuationToken == "resume", "explicit resumable bound failure")
+    bucketExpect(bounded.next() == null && bucketRequests.size == 1, "no request beyond bound")
+
+    bucketReset([])
+    var invalidPages = client.objectPages(maximumPages = 0)
+    val invalid = invalidPages.next()
+    if (invalid == null) { bucketExpect(false, "invalid bound missing failure"); return }
+    bucketExpect(!invalid.succeeded && invalid.result.errorCode == "invalid_pagination_limit" &&
+        bucketRequests.size == 0, "invalid bound has no IO")
+    bucketExpect(!client.listObjects(maxKeys = 0).succeeded &&
+        !client.listObjects(maxKeys = 1001).succeeded && bucketRequests.size == 0, "invalid max keys have no IO")
+
+    bucketReset([bucketResponse(bucketPage("", "", true, "A")),
+        bucketResponse(bucketPage("", "", true, "B")), bucketResponse(bucketPage("", "", true, "A"))])
+    var cycle = client.objectPages(maximumPages = 3)
+    cycle.next(); cycle.next(); cycle.next()
+    val cycleEnd = cycle.next()
+    if (cycleEnd == null) { bucketExpect(false, "cycle ended silently"); return }
+    bucketExpect(!cycleEnd.succeeded && cycleEnd.result.errorCode == "pagination_limit" &&
+        bucketRequests.size == 3, "longer token cycle is bounded")
+}
+
+fun testBucketErrors(): void {
+    val client = bucketClient()
+    val invalid: array<string> = [
+        "<ListBucketResult>", "<Other/>",
+        "<!DOCTYPE ListBucketResult SYSTEM 'file:///must-not-open'><ListBucketResult/>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><IsTruncated>false</IsTruncated></ListBucketResult>",
+        "<ListBucketResult><IsTruncated><x>false</x></IsTruncated></ListBucketResult>",
+        bucketPage(bucketObject("bad", "-1")), bucketPage(bucketObject("bad", "9223372036854775808")),
+        bucketPage(bucketObject("bad", "1x")), bucketPage(bucketObject("bad%")),
+        bucketPage(bucketObject("bad%G0")), bucketPage(bucketObject("bad%FF")),
+        bucketPage(bucketObject("a<Nested/>b")), bucketPage("", "", true),
+        "<ListBucketResult xmlns='foreign'><IsTruncated>false</IsTruncated></ListBucketResult>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><KeyCount>x</KeyCount></ListBucketResult>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><MaxKeys>-1</MaxKeys></ListBucketResult>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><MaxKeys>1001</MaxKeys></ListBucketResult>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><EncodingType>url</EncodingType><EncodingType>url</EncodingType></ListBucketResult>",
+        bucketPage("<Contents><Size>0</Size></Contents>"),
+        bucketPage("", "<CommonPrefixes><Prefix/></CommonPrefixes>"),
+        "<ListBucketResult/>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><KeyCount>1</KeyCount></ListBucketResult>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><MaxKeys>0</MaxKeys>" + bucketObject("x") + "</ListBucketResult>"
+    ]
+    for (body in invalid) {
+        bucketReset([bucketResponse(body)])
+        val page = client.listObjects()
+        bucketExpect(!page.succeeded && page.result.errorCode == "invalid_response" &&
+            page.result.status == 200 && page.result.requestId == "bucket-request", "invalid response retains metadata")
+    }
+    bucketReset([bucketResponse(bucketPage("", "", true, "same"))])
+    bucketExpect(client.listObjects(continuationToken = "same").result.errorCode == "invalid_response", "unchanged token")
+    bucketReset([bucketResponse("<Error><Code>Access&amp;Denied</Code><Message>Not &lt;allowed&gt;</Message></Error>", 403)])
+    val denied = client.listObjects()
+    bucketExpect(!denied.succeeded && denied.result.status == 403 &&
+        denied.result.errorCode == "Access&Denied" && denied.result.errorMessage == "Not <allowed>" &&
+        denied.result.requestId == "bucket-request", "provider error XML")
+    bucketReset([bucketResponse("<Error><Code>LateError</Code><Message>Failed</Message></Error>")])
+    bucketExpect(client.listObjects().result.errorCode == "LateError", "HTTP200 error document")
+
+    bucketReset([bucketResponse("<Error><Code>SlowDown</Code></Error>", 503), bucketResponse(bucketPage())])
+    val retried = client.listObjects()
+    bucketExpect(retried.succeeded && retried.result.retries == 1 && bucketWaits == 1 &&
+        bucketRequests.size == 2, "existing retry policy")
+    bucketExpect(bucketRequests[0].header("x-amz-date") != bucketRequests[1].header("x-amz-date") &&
+        bucketRequests[0].header("Authorization") != bucketRequests[1].header("Authorization"), "retry re-signs")
+    var large = ""
+    while (large.size < 5000) large = "${large}xxxxxxxxxxxxxxxx"
+    bucketReset([bucketResponse(large)])
+    bucketExpect(client.listObjects().result.errorCode == "response_too_large", "response byte bound")
+    val cut = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n<ListBucketResult>"
+    bucketReset([cut, cut])
+    bucketExpect(client.listObjects().result.errorCode == "incomplete_response" && bucketRequests.size == 2,
+        "truncated HTTP framing uses bounded retries")
+    bucketReset([bucketResponse(bucketPage("", "", true, "resume")), bucketResponse("", 403)])
+    var failedPages = client.objectPages()
+    failedPages.next()
+    val failedPage = failedPages.next()
+    if (failedPage == null) { bucketExpect(false, "paging error hidden"); return }
+    bucketExpect(!failedPage.succeeded && failedPage.result.status == 403 &&
+        failedPages.next() == null && failedPages.result.status == 403 &&
+        failedPages.continuationToken == "resume", "mid-list error is terminal and resumable")
+}
+
+fun testBucketAdministration(): void {
+    val client = bucketClient()
+    bucketReset(["HTTP/1.1 200 OK\r\nContent-Length: 123\r\nx-amz-bucket-region: eu-west-1\r\n\r\n"])
+    val head = client.headBucket()
+    bucketExpect(head.succeeded && head.contentLength == 123 && head.bucketRegion == "eu-west-1" &&
+        bucketRequests[0].method == "HEAD" && bucketRequests[0].path == "/bucket-test", "bodyless HEAD")
+    bucketReset(["HTTP/1.1 403 Forbidden\r\nx-amz-request-id: denied\r\nx-amz-bucket-region: eu-west-2\r\n\r\n"])
+    val denied = client.headBucket()
+    bucketExpect(!denied.succeeded && denied.status == 403 && denied.errorCode == "s3_error" &&
+        denied.bucketRegion == "eu-west-2" && denied.requestId == "denied", "HEAD failure and region hint")
+    bucketReset(["HTTP/1.1 301 Moved Permanently\r\nx-amz-bucket-region: eu-west-3\r\n\r\n"])
+    val moved = client.headBucket()
+    bucketExpect(!moved.succeeded && moved.status == 301 && moved.bucketRegion == "eu-west-3" &&
+        bucketRequests.size == 1, "region redirect is exposed, not followed")
+    bucketReset([bucketResponse("")])
+    bucketExpect(client.createBucket().succeeded && bucketRequests[0].method == "PUT" &&
+        bucketRequests[0].path == "/bucket-test" && bucketRequests[0].body == "", "us-east-1 creation has no constraint")
+    bucketReset([bucketResponse("")])
+    bucketExpect(bucketClient(false, "eu-west-1").createBucket().succeeded, "regional virtual-host creation")
+    val regional = bucketRequests[0]
+    bucketExpect(regional.path == "/" && regional.body ==
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>" &&
+        regional.header("Content-Type") == "application/xml", "regional XML")
+    bucketExpect(regional.header("x-amz-content-sha256") == s3PayloadHash(regional.body) &&
+        regional.header("Authorization").contains("/eu-west-1/s3/aws4_request"), "XML payload signing")
+    bucketReset([bucketResponse("")])
+    bucketExpect(client.createBucket("eu-central-1").succeeded &&
+        bucketRequests[0].body.contains("<LocationConstraint>eu-central-1</LocationConstraint>") &&
+        bucketRequests[0].header("Authorization").contains("/us-east-1/s3/aws4_request"), "constraint does not change signing region")
+    bucketReset([bucketResponse("")])
+    bucketExpect(bucketClient(true, "auto").createBucket().succeeded &&
+        bucketRequests[0].body == "", "R2 auto creation")
+    bucketReset([])
+    bucketExpect(client.createBucket("<bad>").errorCode == "invalid_location_constraint" &&
+        bucketRequests.size == 0, "invalid constraint has no IO")
+    bucketReset([bucketResponse("<Error><Code>BucketAlreadyOwnedByYou</Code><Message>Owned</Message></Error>", 409)])
+    val owned = client.createBucket()
+    bucketExpect(!owned.succeeded && owned.status == 409 &&
+        owned.errorCode == "BucketAlreadyOwnedByYou", "creation error stays an error")
+}
+
+fun main: int {
+    testBucketListing()
+    testBucketPaging()
+    testBucketErrors()
+    testBucketAdministration()
+    println("bucket tests: $bucketChecks checks")
+    0
+}

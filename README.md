@@ -1,8 +1,8 @@
 # Abla S3
 
 A small, typed S3-compatible client written in Abla. It signs requests with
-AWS Signature Version 4 and provides object upload, download, metadata, and
-deletion for AWS S3-style HTTPS endpoints, including multi-GB objects in bounded
+AWS Signature Version 4 and provides object upload, download, metadata,
+deletion, bounded listing, and bucket creation/metadata for AWS S3-style HTTPS endpoints, including multi-GB objects in bounded
 memory and presigned URLs. The real compatibility suite
 currently exercises SeaweedFS; provider-specific endpoints can use the same typed
 configuration without changing the signing implementation.
@@ -66,6 +66,72 @@ provider-specific region value.
 The hosted Abla transport bounds TCP connection establishment to ten seconds.
 Larger `S3_TIMEOUT_MS` values remain valid for the client's retry policy and
 are clamped only at the socket-connect boundary.
+
+## Buckets and object listings
+
+All bucket operations address the bucket in `S3Config`, with the same signing,
+path-style/virtual-host addressing, response byte limit and bounded retries as
+other requests:
+
+- `headBucket(): S3Result` checks access. `bucketRegion` retains the server's
+  `x-amz-bucket-region` hint, including on errors. A bodyless 403 stays an
+  error; it does not establish that the bucket is absent.
+- `createBucket(locationConstraint = ""): S3Result` sends a signed PUT. An
+  empty argument uses `config.regionName`; `us-east-1` and R2's `auto` send
+  no configuration body. Other constraints use `CreateBucketConfiguration`
+  XML. The argument does not change the configured signing region or endpoint.
+  Use the intended regional endpoint for AWS; the global `s3.amazonaws.com`
+  endpoint requires signing in `us-east-1` and may return a redirect for
+  another location. Redirects and provider errors are returned to the caller,
+  without automatically forwarding credentials or treating an already-owned
+  bucket as a new success.
+- `listObjects(prefix = "", delimiter = "", maxKeys = 1000,
+  continuationToken = ""): S3ObjectList` fetches one ListObjectsV2 page.
+  `maxKeys` is 1 through 1000. Each `S3Object` exposes `key`, `size`, `etag`,
+  `lastModified` and `storageClass`. `commonPrefixes` contains delimiter groups;
+  `truncated` and `nextContinuationToken` expose paging.
+
+Listings request `encoding-type=url`. XML entities and then percent-encoded
+keys/prefixes are decoded exactly once; a literal `+` remains `+`. Percent decoding is skipped
+when the response omits `EncodingType=url`. Continuation
+tokens remain opaque. Malformed XML, invalid sizes, invalid encodings or a
+truncated page without a progressing token return `invalid_response`, with the
+HTTP status, request ID and retry count retained in `result`. XML parsing uses
+the existing bounded abla-xml dependency, with DTDs/external entities disabled.
+No object bodies are downloaded.
+
+For a lazy traversal, store the mutable state returned by
+`objectPages(prefix, delimiter, maxKeys, maximumPages, continuationToken)` and
+call `next()` until it returns null. The iterator retains its current result
+and token rather than accumulating pages. A failed page is returned once
+before null, so callers must check `succeeded`. Reaching `maximumPages` while
+more pages remain returns `pagination_limit`, not clean exhaustion; resume
+from the iterator's `continuationToken`. Each page fetch still uses the
+configured network retry bound. Missing/unchanged tokens fail; longer token
+cycles cannot exceed the page bound.
+
+```abla fragment
+var pages = client.objectPages(prefix = "archives/", maximumPages = 100)
+var finished = false
+while (!finished) {
+    val page = pages.next()
+    if (page == null) finished = true
+    else if (!page.succeeded) {
+        eprintln("${page.result.errorCode}: ${page.result.errorMessage}")
+        finished = true
+    } else {
+        for (item in page.objects) println(item.key)
+        for (prefix in page.commonPrefixes) println(prefix)
+    }
+}
+```
+
+The new operations are tested against a local fake S3 with synthetic/recorded
+responses, including paging and errors. They have not been tested against AWS
+or R2. Protocol references: [ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html),
+[HeadBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadBucket.html),
+[CreateBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateBucket.html)
+and [R2 compatibility](https://developers.cloudflare.com/r2/api/s3/api/).
 
 ## Streaming transfers
 
@@ -205,11 +271,11 @@ result, part size limits), through the fake server only.
 
 ## Scope
 
-This release intentionally does not expose bucket administration, ACLs, or
-unbounded listing. Transfers send one part at a time, and an upload can't be
-continued by a later process, only cleaned up. Those can be added as typed
-operations with their own limits and compatibility tests when a real consumer
-needs them.
+Bucket administration covers creation and HEAD only; ACLs and directory-bucket
+endpoint workflows are outside this API. Listing is bounded. Transfers send one
+part at a time, and an upload can't be continued by a later process, only cleaned
+up. Further operations need typed APIs with their own limits and compatibility
+tests.
 
 ## License
 
