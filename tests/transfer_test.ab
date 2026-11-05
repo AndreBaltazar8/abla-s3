@@ -810,6 +810,40 @@ fun testWireParsing(): int {
     if (body.body != "hello" || !body.complete || !body.bounded) return 502
     if (scriptedNext != 4) return 503
 
+    // Multiple informational heads and the final head can be coalesced. Do
+    // not read again until the buffered final head and body have been used.
+    val coalesced = scriptedWire([
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: x\r\n\r\n" +
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"a\"\r\n\r\nhe",
+        "llo", "ignored"
+    ])
+    val coalescedHead = s3ReadHead(coalesced)
+    if (!coalescedHead.received || coalescedHead.response.status != 200 ||
+        coalescedHead.bodyStart != "he" || scriptedNext != 1) return 513
+    val coalescedBody = s3ReadSmallBody(coalesced, coalescedHead, 1024)
+    if (!coalescedBody.complete || coalescedBody.body != "hello" ||
+        scriptedNext != 2) return 514
+
+    if (s3ReadHead(scriptedWire(["HTTP/1.1 100 Continue\r\n\r\n"])).received)
+        return 515
+    val upgrade = s3ReadHead(scriptedWire([
+        "HTTP/1.1 101 Switching Protocols\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\n"
+    ]))
+    if (upgrade.received || scriptedNext != 1) return 516
+
+    // The header budget includes all informational heads, not just the last.
+    var padding = ""
+    while (padding.size < 8192) padding = "${padding}xxxxxxxx"
+    val many: array<string> = []
+    var hints = 0
+    while (hints < 9) {
+        many.append("HTTP/1.1 103 Early Hints\r\nX-Pad: $padding\r\n\r\n")
+        hints = hints + 1
+    }
+    many.append("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    if (s3ReadHead(scriptedWire(many)).received || scriptedNext > 9) return 517
+
     // A connection that ends early, in the head and in the body.
     if (s3ReadHead(scriptedWire(["HTTP/1.1 200 OK\r\nETag"])).received) return 504
     if (s3ReadHead(scriptedWire([])).received) return 505

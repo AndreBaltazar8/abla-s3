@@ -129,26 +129,54 @@ class S3WireHead(
     val bodyStart: string
 )
 
+// Only identify informational status lines here. The general HTTP parser
+// correctly skips them and therefore cannot parse an isolated interim block.
+private fun s3WireStatus(input: string): int {
+    if (input.size < 13 ||
+        !(input.startsWith("HTTP/1.0 ") || input.startsWith("HTTP/1.1 ")) ||
+        input[12] != 32) return 0
+    var status = 0
+    var index = 9
+    while (index < 12) {
+        if (input[index] < 48 || input[index] > 57) return 0
+        status = status * 10 + input[index] - 48
+        index = index + 1
+    }
+    status
+}
+
 fun s3ReadHead(wire: S3Wire): S3WireHead {
     val read = wire.read
     var input = ""
+    var headerBytes = 0
     var head = S3WireHead(false, HttpResponse(0, [], ""), "")
     var reading = true
     while (reading) {
-        val chunk = read(65536)
-        if (chunk.size == 0) reading = false
-        input = "$input$chunk"
+        // Process buffered heads first: the final response can arrive in the
+        // same read as one or more interim responses, without a later read.
         val end = httpHeaderEnd(input)
         if (end >= 0) {
-            val parsed = httpParseResponseBounded(input.slice(0, end), 0).response
-            val rest = input.slice(end, input.size)
-            // Interim responses such as 100 Continue precede the real one.
-            if (parsed.status >= 100 && parsed.status < 200) input = rest
+            headerBytes = headerBytes + end
+            if (headerBytes > 65536) reading = false
             else {
-                if (parsed.status >= 200) head = S3WireHead(true, parsed, rest)
-                reading = false
+                val status = s3WireStatus(input)
+                if (status >= 100 && status < 200 && status != 101) {
+                    input = input.slice(end, input.size)
+                } else {
+                    val parsed = httpParseResponseBounded(input.slice(0, end), 0).response
+                    if (parsed.status >= 200) {
+                        head = S3WireHead(true, parsed, input.slice(end, input.size))
+                    }
+                    // S3 has no protocol-upgrade path: a 101 is terminal too.
+                    reading = false
+                }
             }
-        } else if (input.size > 65536) reading = false
+        } else if (headerBytes + input.size >= 65536) reading = false
+        else {
+            val chunk = read(65536 - headerBytes - input.size)
+            if (chunk.size == 0) reading = false
+            else input = "$input$chunk"
+        }
     }
     head
 }
