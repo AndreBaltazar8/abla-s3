@@ -3,7 +3,8 @@ set -euo pipefail
 
 test_binary=${1:?integration test binary is required}
 work=$(mktemp -d /tmp/abla-s3-seaweedfs.XXXXXX)
-port_base=$((20000 + ($$ % 10000)))
+source "$(dirname "${BASH_SOURCE[0]}")/seaweed-ports.sh"
+port_base=$(pick_port_base) || { echo "no free port range for SeaweedFS" >&2; exit 2; }
 s3_port=$port_base
 master_port=$((port_base + 1))
 volume_port=$((port_base + 2))

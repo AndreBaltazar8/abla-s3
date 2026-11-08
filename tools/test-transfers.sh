@@ -18,22 +18,7 @@ part_bytes=${S3_TEST_PART_BYTES:-16777216}
 # growth, buffers, and the program itself.
 peak_limit_kib=$(((part_bytes / 1024) * 2 + 120 * 1024))
 work=$(mktemp -d /tmp/abla-s3-transfers.XXXXXX)
-# SeaweedFS's gRPC port is each port plus 10000, so ports run from base to base+5 and from
-# base+10000 to base+10005. All of them stay below Linux's ephemeral range (32768 and up), where
-# another program's outgoing connection may hold one, and none may be listening already.
-port_listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-pick_port_base() {
-    local base offset port
-    for offset in $(seq 0 99); do
-        base=$((10000 + ($$ + offset * 97) % 12000))
-        for port in $(seq "$base" $((base + 5))) $(seq $((base + 10000)) $((base + 10005))); do
-            if port_listening "$port"; then continue 2; fi
-        done
-        echo "$base"
-        return 0
-    done
-    return 1
-}
+source "$(dirname "${BASH_SOURCE[0]}")/seaweed-ports.sh"
 port_base=$(pick_port_base) || { echo "no free port range for SeaweedFS" >&2; exit 2; }
 s3_port=$port_base
 master_port=$((port_base + 1))
