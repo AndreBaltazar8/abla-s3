@@ -87,11 +87,11 @@ fun s3OpenWire(config: S3Config): S3Wire {
     if (connection.descriptor < 0) return s3NoWire()
     if (config.useTls) {
         s3BlockBrokenPipe()
-        // Every later read and write is bounded by the configured timeout; the handshake gets at least five seconds, as signing
-        // and verifying a chain is not a read. (The socket gets no options of its own here: a socket that has them keeps
-        // whatever the handshake last set, so the timeouts are the upgrade's to apply.)
-        val handshake = if (config.timeoutMilliseconds < 5000) 5000 else s3TransportTimeout(config.timeoutMilliseconds)
-        val handle = tlsRelease(tlsUpgrade(connection, host, "", handshake, config.timeoutMilliseconds))
+        // The configured timeout bounds the handshake (each wait for the peer) and every later read and write. The socket
+        // gets no options of its own here: a socket that has them keeps whatever the handshake last set, so the timeouts
+        // are the upgrade's to apply.
+        val timeout = s3TransportTimeout(config.timeoutMilliseconds)
+        val handle = tlsRelease(tlsUpgrade(connection, host, "", timeout, config.timeoutMilliseconds))
         if (handle < 0) s3NoWire() else s3TlsWire(handle)
     } else {
         s3SetSocketTimeouts(connection.descriptor, config.timeoutMilliseconds)
