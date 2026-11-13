@@ -7,19 +7,18 @@ import "abla/io"
 import "abla/process"
 import "abla/process/time"
 import "abla/sys/linux"
-import "abla/tls/hosted"
+import "abla/tls/pure"
 import "abla/unsafe/memory"
 
 // An unread close with a zero linger sends RST rather than FIN.
 trusted fun peerReset(var connection: TlsConnection): void {
-    val descriptor = tlsControlInt(connection.handle, 16)
+    val descriptor = connection.detach()
     val linger = nativeByteBuffer(8)
     // l_onoff 1, l_linger 0.
     linger.storeI64(0, 1)
     linuxSyscall5(54, descriptor, 1, 13, nativePointerAddress(linger.address), 8)
     linger.close()
     linuxTcpCloseDescriptor(descriptor)
-    connection.handle = -1
     return
 }
 
@@ -30,8 +29,7 @@ fun peerServe(var listener: TlsListener): void {
         var connection = listener.accept()
         val request = connection.read(65536)
         if (request.contains("/stall ")) {
-            held.append(connection.handle)
-            connection.handle = -1
+            held.append(connection.detach())
         } else if (request.contains("/reset") ||
             (request.contains("/flaky ") && flaky == 0)) {
             if (request.contains("/flaky ")) flaky = 1

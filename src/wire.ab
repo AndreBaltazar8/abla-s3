@@ -3,7 +3,7 @@ import "abla/dns"
 import "abla/http"
 import "abla/net"
 import "abla/sys/linux"
-import "abla/tls/hosted"
+import "abla/tls/pure"
 import "abla/unsafe/memory"
 import "config.ab"
 
@@ -68,18 +68,8 @@ private fun s3TcpWire(descriptor: int): S3Wire = S3Wire(
 
 private fun s3TlsWire(handle: int): S3Wire = S3Wire(
     true,
-    { bytes: string ->
-        var connection = TlsConnection(handle)
-        val written = connection.write(bytes) == bytes.size
-        connection.handle = -1
-        written
-    },
-    { maximum: int ->
-        var connection = TlsConnection(handle)
-        val bytes = connection.read(maximum)
-        connection.handle = -1
-        bytes
-    },
+    { bytes: string -> tlsWriteHandle(handle, bytes) == bytes.size },
+    { maximum: int -> tlsReadHandle(handle, maximum) },
     { ->
         tlsCloseHandle(handle)
         return
@@ -95,14 +85,16 @@ fun s3OpenWire(config: S3Config): S3Wire {
         address, config.port, s3TransportTimeout(config.timeoutMilliseconds)
     )
     if (connection.descriptor < 0) return s3NoWire()
-    s3SetSocketTimeouts(connection.descriptor, config.timeoutMilliseconds)
     if (config.useTls) {
         s3BlockBrokenPipe()
-        var secured = tlsUpgrade(connection, host)
-        val handle = secured.handle
-        secured.handle = -1
+        // Every later read and write is bounded by the configured timeout; the handshake gets at least five seconds, as signing
+        // and verifying a chain is not a read. (The socket gets no options of its own here: a socket that has them keeps
+        // whatever the handshake last set, so the timeouts are the upgrade's to apply.)
+        val handshake = if (config.timeoutMilliseconds < 5000) 5000 else s3TransportTimeout(config.timeoutMilliseconds)
+        val handle = tlsRelease(tlsUpgrade(connection, host, "", handshake, config.timeoutMilliseconds))
         if (handle < 0) s3NoWire() else s3TlsWire(handle)
     } else {
+        s3SetSocketTimeouts(connection.descriptor, config.timeoutMilliseconds)
         val descriptor = connection.descriptor
         connection.descriptor = -1
         s3TcpWire(descriptor)
