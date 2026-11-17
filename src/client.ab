@@ -4,7 +4,6 @@ import github("AndreBaltazar8/abla-xml")
 import "config.ab"
 import "signing.ab"
 import "wire.ab"
-import "../.abla/packages/abla-xml/source/src/parse.ab"
 
 class S3Result(
     val succeeded: bool,

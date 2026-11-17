@@ -4,8 +4,6 @@ import "client.ab"
 import "multipart.ab"
 import "abla/text"
 import "./signing.ab"
-import "../.abla/packages/abla-xml/source/src/parse.ab"
-import "../.abla/packages/abla-xml/source/src/tree.ab"
 
 class S3Object(
     val key: string,
