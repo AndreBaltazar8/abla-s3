@@ -9,6 +9,11 @@ import "abla/process/time"
 import "abla/sys/linux"
 import "abla/tls/pure"
 import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/net"
+import "abla/text"
+import "../src/config.ab"
+import "../src/client.ab"
 
 // An unread close with a zero linger sends RST rather than FIN.
 trusted fun peerReset(var connection: TlsConnection): void {

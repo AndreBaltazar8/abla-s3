@@ -7,6 +7,11 @@ import "config.ab"
 import "signing.ab"
 import "wire.ab"
 import "client.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/text"
+import "../.abla/packages/abla-xml/source/src/tree.ab"
+import "../.abla/packages/abla-xml/source/src/parse.ab"
 
 fun s3MinimumPartBytes(): int = 5242880
 fun s3MaximumPartBytes(): int = 5368709120

@@ -1,4 +1,7 @@
 import "../src/s3.ab"
+import "abla/http"
+import "../src/config.ab"
+import "../src/client.ab"
 
 var s3ClientTestMode: int = 0
 var s3ClientTestAttempts: int = 0

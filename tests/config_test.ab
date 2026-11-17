@@ -1,4 +1,5 @@
 import "../src/s3.ab"
+import "../src/config.ab"
 
 fun main: int {
     val config = s3ConfigFromEnvironment()

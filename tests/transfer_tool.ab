@@ -8,6 +8,14 @@ import "abla/memory"
 import "abla/process"
 import "abla/process/time"
 import "abla/sys/linux"
+import "../src/config.ab"
+import "../src/transfer.ab"
+import "../src/multipart.ab"
+import "../src/wire.ab"
+import "abla/text"
+import "../src/client.ab"
+import "../src/signing.ab"
+import "abla/sys/linux/process"
 
 fun toolReport(label: string, result: S3TransferResult): int {
     eprintln("$label ok=${result.succeeded} bytes=${result.bytes} parts=${result.parts} retries=${result.retries} code=${result.errorCode} status=${result.status} resumed_from=${result.resumedFrom} leftover=${result.leftoverUploadId}")

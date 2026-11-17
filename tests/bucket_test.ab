@@ -3,6 +3,14 @@
 import "../src/s3.ab"
 import "abla/io"
 import "abla/process"
+import "../src/buckets.ab"
+import "abla/bytes"
+import "abla/text"
+import "../src/wire.ab"
+import "abla/http"
+import "../src/client.ab"
+import "../src/config.ab"
+import "../src/multipart.ab"
 
 var bucketResponses: array<string> = []
 var bucketRequests: array<HttpRequest> = []

@@ -1,5 +1,8 @@
 import "../src/s3.ab"
 import "abla/io"
+import "../src/config.ab"
+import "../src/client.ab"
+import "abla/bytes"
 
 fun s3IntegrationFailure(code: int, result: S3Result): int {
     eprintln("S3 integration failure $code: status=${result.status} code=${result.errorCode} message=${result.errorMessage} request=${result.requestId}")

@@ -1,5 +1,8 @@
 import "../src/s3.ab"
 import "abla/io"
+import "../src/signing.ab"
+import "abla/bytes"
+import "../src/config.ab"
 
 fun s3SigningTestConfig(): S3Config = S3Config(
     "s3.amazonaws.com", 443, "examplebucket", "us-east-1",
