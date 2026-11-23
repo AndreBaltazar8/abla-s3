@@ -355,7 +355,7 @@ weed s3 "${gateway_flags[@]}" -filer="127.0.0.1:$filer_port" -ip.bind=127.0.0.1 
 gateway_pid=$!
 if wait_for_port "$tls_port"; then
     tls_env=(env S3_ENDPOINT_HOST=localhost S3_ENDPOINT_PORT="$tls_port"
-        S3_USE_TLS=true SSL_CERT_FILE="$work/tls.crt")
+        S3_USE_TLS=true NIX_SSL_CERT_FILE="$work/tls.crt" SSL_CERT_FILE="$work/tls.crt")
     start=$SECONDS
     "${tls_env[@]}" "$tool" upload-file tls/medium.bin "$medium" 2>"$work/log"
     check "TLS upload succeeds" test $? -eq 0
@@ -370,7 +370,7 @@ if wait_for_port "$tls_port"; then
     find "$work/tls-back.bin" -delete
     # Without the certificate in the trust store the connection must fail.
     env S3_ENDPOINT_HOST=localhost S3_ENDPOINT_PORT="$tls_port" S3_USE_TLS=true \
-        SSL_CERT_FILE=/dev/null S3_MAX_NETWORK_RETRIES=0 \
+        NIX_SSL_CERT_FILE=/dev/null SSL_CERT_FILE=/dev/null S3_MAX_NETWORK_RETRIES=0 \
         "$tool" size tls/medium.bin >/dev/null 2>&1
     check "an untrusted certificate is refused" test $? -eq 3
     # The gateway dies mid-upload. OpenSSL then writes to a reset socket, which
