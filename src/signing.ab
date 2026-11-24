@@ -1,9 +1,7 @@
 import "abla/crypto"
 import "abla/http"
-import "abla/sys/linux"
+import "abla/sys/linux/process"
 import "config.ab"
-import "abla/unsafe/memory"
-import "abla/unsafe/memory/raw"
 import "abla/text"
 
 class S3Header(val name: string, val value: string)
@@ -51,17 +49,7 @@ fun s3UnixToAmzDate(unixSeconds: int): string {
     "${s3Pad(year, 4)}${s3Pad(month, 2)}${s3Pad(day, 2)}T${s3Pad(hour, 2)}${s3Pad(minute, 2)}${s3Pad(second, 2)}Z"
 }
 
-fun s3RealtimeSeconds(): int {
-    val timestamp = nativeByteBuffer(16)
-    timestamp.storeI64(0, 0)
-    timestamp.storeI64(8, 0)
-    val status = linuxSyscall2(
-        228, 0, nativePointerAddress(timestamp.address)
-    )
-    val result = if (status == 0) timestamp.loadI64(0) else 0
-    timestamp.close()
-    result
-}
+fun s3RealtimeSeconds(): int = linuxRealtimeNanoseconds() / 1000000000
 
 fun s3NowAmzDate(): string = s3UnixToAmzDate(s3RealtimeSeconds())
 

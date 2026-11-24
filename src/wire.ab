@@ -4,10 +4,8 @@ import "abla/http"
 import "abla/net"
 import "abla/sys/linux"
 import "abla/tls/pure"
-import "abla/unsafe/memory"
 import "config.ab"
 import "abla/text"
-import "abla/unsafe/memory/raw"
 
 // One connection for one streaming request. The whole-object transport takes
 // and returns complete bodies; a wire moves a body piece by piece. A read
@@ -29,22 +27,15 @@ fun s3NoWire(): S3Wire = S3Wire(
 // A socket option bounds each blocking read and write, which covers OpenSSL's
 // as well: the TLS adapter has no timeouts of its own once it is connected.
 private fun s3SetSocketTimeouts(descriptor: int, milliseconds: int): void {
-    val interval = nativeByteBuffer(16)
-    interval.storeI64(0, milliseconds / 1000)
-    interval.storeI64(8, (milliseconds - milliseconds / 1000 * 1000) * 1000)
-    linuxSyscall5(54, descriptor, 1, 20, nativePointerAddress(interval.address), 16)
-    linuxSyscall5(54, descriptor, 1, 21, nativePointerAddress(interval.address), 16)
-    interval.close()
+    linuxSocketSetTimeouts(descriptor, milliseconds, milliseconds)
     return
 }
 
 // OpenSSL writes with write(2), so a peer that resets during an upload would
 // otherwise raise SIGPIPE and end the process. The mask is per thread.
 private fun s3BlockBrokenPipe(): void {
-    val signals = nativeByteBuffer(8)
-    signals.storeI64(0, 4096)
-    linuxSyscall4(14, 0, nativePointerAddress(signals.address), 0, 8)
-    signals.close()
+    // The mask is not restored: the thread keeps SIGPIPE blocked, as before.
+    linuxBrokenPipeHold()
     return
 }
 
