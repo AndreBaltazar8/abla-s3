@@ -76,7 +76,7 @@ fun runFaults(port: int): int {
     0
 }
 
-fun main: int {
+trusted fun main: int {
     var listener = tlsListen(processArgument(0), processArgument(1), "::", 0)
     val port = listener.localPort()
     if (port <= 0) { eprintln("no listener"); return 10 }
