@@ -525,7 +525,7 @@ fun S3Client.downloadFile(
         key, { bytes: string -> linuxWriteAll(descriptor, bytes) },
         start, total, stored.etag, options.maximumRetries
     )
-    val synced = !result.succeeded || linuxSyscall1(74, descriptor) == 0
+    val synced = !result.succeeded || linuxFileSync(descriptor)
     file.close()
     if (!result.succeeded || !synced) {
         if (!options.resume) s3RemoveQuietly(partial)
@@ -540,7 +540,7 @@ fun S3Client.downloadFile(
     s3RemoveQuietly(marker)
     val directory = linuxOpen(target.parent().text)
     if (directory.descriptor >= 0) {
-        linuxSyscall1(74, directory.descriptor)
+        linuxFileSync(directory.descriptor)
         directory.close()
     }
     S3TransferResult(

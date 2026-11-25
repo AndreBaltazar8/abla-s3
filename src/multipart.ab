@@ -1,14 +1,13 @@
 import "abla/bytes"
 import "abla/crypto"
 import "abla/http"
-import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/net"
 import github("AndreBaltazar8/abla-xml")
 import "config.ab"
 import "signing.ab"
 import "wire.ab"
 import "client.ab"
-import "abla/unsafe/memory"
-import "abla/unsafe/memory/raw"
 import "abla/text"
 
 fun s3MinimumPartBytes(): int = 5242880
@@ -183,18 +182,9 @@ fun S3Client.sendOnce(
 }
 
 fun s3ReadFileAt(descriptor: int, offset: int, maximum: int): string {
-    val buffer = nativeByteBuffer(maximum + 1)
-    var measured = linuxSyscall4(
-        17, descriptor, nativePointerAddress(buffer.address), maximum, offset
-    )
-    while (measured == -4) measured = linuxSyscall4(
-        17, descriptor, nativePointerAddress(buffer.address), maximum, offset
-    )
-    if (measured > 0) buffer.adoptString(measured)
-    else {
-        buffer.close()
-        ""
-    }
+    val result = SocketReceiveResult("", 0)
+    linuxReadAtDescriptor(descriptor, offset, maximum, result)
+    if (result.status > 0) result.text else ""
 }
 
 fun s3WriteBody(wire: S3Wire, var body: S3RequestBody): bool {
