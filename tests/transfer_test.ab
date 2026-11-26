@@ -275,6 +275,8 @@ fun testConfig(): S3Config = S3Config(
 )
 
 fun testClock(): string = "20260818T000000Z"
+fun testInvalidClock(): string = ""
+fun testClockBeforeRequest(): string = if (fakeLog.size == 0) testClock() else ""
 var testWaits: int = 0
 fun testWait(milliseconds: int): void {
     testWaits = testWaits + 1
@@ -903,6 +905,35 @@ fun testLowLevel(client: S3Client): int {
     0
 }
 
+fun testSigningFailures(): int {
+    fakeReset()
+    val connections = fakeWires
+    val badClockClient = s3ClientWithWire(testConfig(), fakeConnect, testInvalidClock, testWait)
+    val multipart = badClockClient.createMultipartUpload("big/unsigned.bin")
+    if (multipart.succeeded || multipart.result.errorCode != "invalid_request" ||
+        multipart.result.status != 0 || multipart.result.retries != 0 ||
+        multipart.uploadId != "" || fakeWires != connections) return 608
+
+    val data = testData(5000)
+    fakeObject = data
+    fakeObjectStored = true
+    fakeFaults = ["GET cutat"]
+    fakeCut = 1234
+    val client = s3ClientWithWire(testConfig(), fakeConnect, testClockBeforeRequest, testWait)
+    val received = byteBuffer()
+    val result = client.streamRange("big/unsigned.bin", { bytes ->
+        received.appendText(bytes)
+        true
+    }, 19, data.size, fakeEtag, 2)
+    val actual = received.toText()
+    if (result.succeeded || result.errorCode != "invalid_request" ||
+        result.errorMessage != "invalid_request" || result.status != 0 ||
+        result.parts != 0 || result.retries != 1 || actual.size == 0 ||
+        actual.size >= data.size - 19 || result.bytes != actual.size ||
+        actual != data.slice(19, 19 + actual.size) || fakeWires != connections + 1) return 609
+    0
+}
+
 fun testSweep(client: S3Client): int {
     fakeReset()
     fakeListing = "<ListMultipartUploadsResult>" +
@@ -937,6 +968,7 @@ fun main: int {
     if (failed == 0) failed = testFiles(client, directory)
     if (failed == 0) failed = testDownloads(client)
     if (failed == 0) failed = testLowLevel(client)
+    if (failed == 0) failed = testSigningFailures()
     if (failed == 0) failed = testSweep(client)
     directory.removeTree()
     if (failed != 0) eprintln("transfer test failed: $failed")

@@ -17,6 +17,22 @@ class S3Signature(
     val headers: array<HttpHeader>
 )
 
+/** The outcome of signing one request. */
+sealed interface S3SigningResult
+
+/** A signed request with its authentication headers and signature details. */
+class S3Signed(
+    val authorization: string,
+    val canonicalRequest: string,
+    val stringToSign: string,
+    val signedHeaders: string,
+    val signature: string,
+    val headers: array<HttpHeader>
+) : S3SigningResult
+
+/** A rejected signing request with its signing error code. */
+class S3SigningRejected(val error: string) : S3SigningResult
+
 fun s3Pad(value: int, width: int): string {
     var text = "$value"
     while (text.size < width) text = "0$text"
@@ -198,13 +214,62 @@ fun s3SignRequest(
     amzDate: string,
     extraHeaders: array<S3Header> = [],
     payloadOverride: string = ""
-): S3Signature {
-    if (!config.valid()) return s3SigningFailure("invalid_configuration")
+): S3Signature = s3SignRequestWith<S3Signature>(
+    config, method, canonicalUri, canonicalQuery, body, amzDate, extraHeaders,
+    payloadOverride,
+    { authorization, canonicalRequest, stringToSign, signedHeaders, signature, headers ->
+        S3Signature(true, "", authorization, canonicalRequest, stringToSign,
+            signedHeaders, signature, headers)
+    },
+    s3SigningFailure
+)
+
+/** Signs a request or returns its rejection code without partial signature fields. */
+fun s3SignRequestResult(
+    config: S3Config,
+    method: string,
+    canonicalUri: string,
+    canonicalQuery: string,
+    body: string,
+    amzDate: string,
+    extraHeaders: array<S3Header> = [],
+    payloadOverride: string = ""
+): S3SigningResult = s3SignRequestWith<S3SigningResult>(
+    config, method, canonicalUri, canonicalQuery, body, amzDate, extraHeaders,
+    payloadOverride, s3SignedResult, s3RejectedResult
+)
+
+private fun s3SignedResult(
+    authorization: string,
+    canonicalRequest: string,
+    stringToSign: string,
+    signedHeaders: string,
+    signature: string,
+    headers: array<HttpHeader>
+): S3SigningResult =
+    S3Signed(authorization, canonicalRequest, stringToSign, signedHeaders, signature, headers)
+
+private fun s3RejectedResult(error: string): S3SigningResult =
+    S3SigningRejected(error)
+
+private fun <T> s3SignRequestWith(
+    config: S3Config,
+    method: string,
+    canonicalUri: string,
+    canonicalQuery: string,
+    body: string,
+    amzDate: string,
+    extraHeaders: array<S3Header>,
+    payloadOverride: string,
+    accept: (string, string, string, string, string, array<HttpHeader>) -> T,
+    reject: (string) -> T
+): T {
+    if (!config.valid()) return reject("invalid_configuration")
     if (!(method == "GET" || method == "PUT" || method == "HEAD" ||
-          method == "DELETE" || method == "POST")) return s3SigningFailure("invalid_method")
+          method == "DELETE" || method == "POST")) return reject("invalid_method")
     if (canonicalUri.size == 0 || canonicalUri[0] != 47 ||
         amzDate.size != 16 || amzDate[8] != 84 || amzDate[15] != 90)
-        return s3SigningFailure("invalid_request")
+        return reject("invalid_request")
     val payloadHash = if (payloadOverride != "") payloadOverride
         else hexEncode(sha256(body))
     val names: array<string> = [
@@ -225,7 +290,7 @@ fun s3SignRequest(
             if (names[foundIndex] == name) unique = false
             foundIndex = foundIndex + 1
         }
-        if (!unique) return s3SigningFailure("invalid_header")
+        if (!unique) return reject("invalid_header")
         names.append(name)
         values.append(value)
         extraIndex = extraIndex + 1
@@ -265,8 +330,8 @@ fun s3SignRequest(
     )
     val authorization = "AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/$scope,SignedHeaders=$signedHeaders,Signature=$signature"
     requestHeaders.append(HttpHeader("Authorization", authorization))
-    S3Signature(
-        true, "", authorization, canonicalRequest, stringToSign,
+    accept(
+        authorization, canonicalRequest, stringToSign,
         signedHeaders, signature, requestHeaders
     )
 }

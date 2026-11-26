@@ -39,6 +39,7 @@ fun s3ClientTestTransport(
 }
 
 fun s3ClientTestClock(): string = "20260818T000000Z"
+fun s3ClientTestInvalidClock(): string = ""
 fun s3ClientTestNoWait(milliseconds: int): void {}
 
 fun s3ClientTestConfig(): S3Config = S3Config(
@@ -117,5 +118,15 @@ fun main: int {
     val truncated = client.getObject("products/truncated.zip")
     if (truncated.errorCode != "s3_error" ||
         truncated.errorMessage != "s3_error") return 14
+
+    val badClockClient = s3ClientWithTransport(
+        s3ClientTestConfig(), s3ClientTestTransport,
+        s3ClientTestInvalidClock, s3ClientTestNoWait
+    )
+    s3ClientTestAttempts = 0
+    val unsigned = badClockClient.getObject("products/preset.zip")
+    if (unsigned.succeeded || unsigned.errorCode != "invalid_request" ||
+        unsigned.errorMessage != "invalid_request" || unsigned.status != 0 ||
+        unsigned.retries != 0 || s3ClientTestAttempts != 0) return 15
     0
 }

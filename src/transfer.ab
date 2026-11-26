@@ -366,11 +366,14 @@ fun S3Client.streamRange(
         var refusedWrongly = false
         val extras = [S3Header("range", "bytes=$offset-${total - 1}")]
         if (conditional) extras.append(S3Header("if-match", etag))
-        val signed = s3SignRequest(
+        val signed = s3SignRequestResult(
             this.config, "GET", path, "", "", clock(), extras
         )
-        if (!signed.succeeded)
-            return s3TransferFailure(signed.error, offset - start, 0, 0, "", "", retries)
+        val headers = when (signed) {
+            is S3Signed -> signed.headers
+            is S3SigningRejected ->
+                return s3TransferFailure(signed.error, offset - start, 0, 0, "", "", retries)
+        }
         val attemptStart = offset
         var lastError = "transport_failed"
         var lastStatus = 0
@@ -380,7 +383,7 @@ fun S3Client.streamRange(
             val read = wire.read
             val close = wire.close
             val requested = write(
-                httpRequest("GET", path, "", signed.headers)
+                httpRequest("GET", path, "", headers)
                     .renderForClient(s3Authority(this.config))
             )
             val head = if (requested) s3ReadHead(wire)

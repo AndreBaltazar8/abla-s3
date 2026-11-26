@@ -11,6 +11,12 @@ fun s3SigningTestConfig(): S3Config = S3Config(
     "", false, true, 30000, 1048576, 0
 )
 
+fun signingRejected(result: S3SigningResult, code: string): bool =
+    when (result) {
+        is S3SigningRejected -> result.error == code
+        is S3Signed -> false
+    }
+
 fun main: int {
     if (s3UnixToAmzDate(0) != "19700101T000000Z") return 1
     if (s3UnixToAmzDate(1369353600) != "20130524T000000Z") return 2
@@ -40,5 +46,50 @@ fun main: int {
         "20130524T000000Z", [S3Header("Host", "evil.example")]
     )
     if (duplicate.succeeded || duplicate.error != "invalid_header") return 11
+
+    val config = s3SigningTestConfig()
+    val date = "20130524T000000Z"
+    val typed = s3SignRequestResult(
+        config, "GET", "/test.txt", "", "", date, [S3Header("Range", "bytes=0-9")]
+    )
+    when (typed) {
+        is S3SigningRejected -> return 12
+        is S3Signed -> {
+            if (typed.canonicalRequest != expectedCanonical || typed.signature != signed.signature ||
+                typed.authorization != signed.authorization || typed.stringToSign != signed.stringToSign ||
+                typed.signedHeaders != signed.signedHeaders || typed.headers.size != signed.headers.size)
+                return 13
+            var index = 0
+            while (index < typed.headers.size) {
+                if (typed.headers[index].name != signed.headers[index].name ||
+                    typed.headers[index].value != signed.headers[index].value) return 14
+                index = index + 1
+            }
+        }
+    }
+
+    val invalidConfig = S3Config("", 443, "examplebucket", "us-east-1",
+        "access-key", "secret-key", "", false, true, 30000, 1048576, 0)
+    if (!signingRejected(s3SignRequestResult(invalidConfig, "GET", "/", "", "", date),
+            "invalid_configuration")) return 15
+    if (!signingRejected(s3SignRequestResult(config, "PATCH", "/", "", "", date),
+            "invalid_method")) return 16
+    if (!signingRejected(s3SignRequestResult(config, "GET", "test.txt", "", "", date),
+            "invalid_request")) return 17
+    if (!signingRejected(s3SignRequestResult(
+        config, "GET", "/", "", "", date, [S3Header("Host", "evil.example")]
+    ), "invalid_header")) return 18
+
+    val query = s3CanonicalQuery(["uploadId", "partNumber"], ["a/b", "2"])
+    val unsignedSignature = "d5b65d285ce6c34055b4ca8c33c1027daa70f56dd8ed4c211eebccd8786a51dc"
+    if (s3SignRequest(config, "PUT", "/test.txt", query, "", date, [],
+            "UNSIGNED-PAYLOAD").signature != unsignedSignature) return 19
+    val typedUnsigned = s3SignRequestResult(
+        config, "PUT", "/test.txt", query, "", date, [], "UNSIGNED-PAYLOAD"
+    )
+    when (typedUnsigned) {
+        is S3SigningRejected -> return 20
+        is S3Signed -> if (typedUnsigned.signature != unsignedSignature) return 21
+    }
     0
 }

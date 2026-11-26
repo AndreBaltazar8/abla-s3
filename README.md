@@ -227,9 +227,10 @@ It never includes the configured credentials or signing key. Use the provider
 request ID when diagnosing a failed request.
 
 `s3ClientWithTransport` injects a transport, clock, and wait function for
-deterministic tests. `s3SignRequest` exposes the canonical request and
-string-to-sign for protocol verification, but applications should normally use
-the object methods.
+deterministic tests. For protocol verification, `s3SignRequestResult` returns
+`S3Signed` with the canonical request, string-to-sign, and signed headers, or
+`S3SigningRejected` with a signing error code. `s3SignRequest` continues to
+return `S3Signature`. Applications should normally use the object methods.
 
 ## Verification
 

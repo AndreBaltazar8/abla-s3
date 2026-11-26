@@ -114,10 +114,13 @@ fun S3Client.sendOnce(
 ): S3Result {
     val clock = this.clock
     val path = this.objectPath(key)
-    val signed = s3SignRequest(
+    val signed = s3SignRequestResult(
         this.config, method, path, query, "", clock(), extras, payloadHash
     )
-    if (!signed.succeeded) return s3InvalidResult(signed.error)
+    val signedHeaders = when (signed) {
+        is S3Signed -> signed.headers
+        is S3SigningRejected -> return s3InvalidResult(signed.error)
+    }
     val connect = this.connect
     val wire = connect()
     if (!wire.connected) return S3Result(
@@ -125,8 +128,8 @@ fun S3Client.sendOnce(
     )
     val headers: array<HttpHeader> = []
     var index = 0
-    while (index < signed.headers.size) {
-        headers.append(signed.headers[index])
+    while (index < signedHeaders.size) {
+        headers.append(signedHeaders[index])
         index = index + 1
     }
     headers.append(HttpHeader("Content-Length", "${body.size}"))

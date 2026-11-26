@@ -135,12 +135,15 @@ fun S3Client.rawRequest(
     while (!finished) {
         val extras: array<S3Header> = []
         if (contentType != "") extras.append(S3Header("content-type", contentType))
-        val signed = s3SignRequest(
+        val signed = s3SignRequestResult(
             this.config, method, path, "", body, clock(), extras
         )
-        if (!signed.succeeded) return s3InvalidResult(signed.error)
+        val headers = when (signed) {
+            is S3Signed -> signed.headers
+            is S3SigningRejected -> return s3InvalidResult(signed.error)
+        }
         val exchanged = transport(
-            httpRequest(method, path, body, signed.headers),
+            httpRequest(method, path, body, headers),
             this.config.maximumResponseBytes,
             this.config.timeoutMilliseconds
         )
